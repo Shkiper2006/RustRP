@@ -5,7 +5,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Configuration;
 using Oxide.Core.Libraries.Covalence;
@@ -36,6 +38,10 @@ namespace Oxide.Plugins
         #region === Config ===
 
         private PluginConfig _config;
+        private string _transactionLogPath;
+
+        [PluginReference]
+        private Plugin Economics;
 
         private class PluginConfig
         {
@@ -120,7 +126,9 @@ namespace Oxide.Plugins
             {
                 public bool Enabled = true;
                 public int BusinessRegistrationCost = 200;
+                public int BusinessRegistrationDurationDays = 7;
                 public int MedicInsuranceCost = 250; // weekly
+                public int MedicInsuranceDurationDays = 7;
                 public float BusinessTaxRate = 0.10f; // 10% (if implementing turnover)
             }
 
@@ -219,7 +227,16 @@ namespace Oxide.Plugins
                 ["LicenseExpired"] = "License {0} has expired.",
                 ["LicenseExpiringSoon"] = "License {0} expires in {1}h.",
                 ["LicenseRequired"] = "Required license: {0}",
-                ["NotEnoughMoney"] = "Not enough scrap. Required: {0}",
+                ["NotEnoughMoney"] = "Not enough funds. Required: {0}",
+                ["PayUsage"] = "Usage: /pay <player> <amount>",
+                ["PayInvalidAmount"] = "Invalid amount.",
+                ["PaySelf"] = "You cannot pay yourself.",
+                ["PaySent"] = "You sent {0} to {1}.",
+                ["PayReceived"] = "You received {0} from {1}.",
+                ["InsurancePurchased"] = "Medical insurance active until: {0}",
+                ["BusinessRegistered"] = "Business registration active until: {0}",
+                ["BusinessTaxCharged"] = "Weekly business tax charged: {0}",
+                ["BusinessTaxFailed"] = "Weekly business tax could not be charged: {0}",
 
                 ["ContractCreated"] = "Contract #{0} created. Reward: {1} scrap.",
                 ["ContractTaken"] = "You have taken contract #{0}.",
@@ -262,7 +279,16 @@ namespace Oxide.Plugins
                 ["LicenseExpired"] = "Лицензия {0} истекла.",
                 ["LicenseExpiringSoon"] = "Лицензия {0} истекает через {1}ч.",
                 ["LicenseRequired"] = "Требуется лицензия: {0}",
-                ["NotEnoughMoney"] = "Недостаточно scrap. Нужно: {0}",
+                ["NotEnoughMoney"] = "Недостаточно средств. Нужно: {0}",
+                ["PayUsage"] = "Использование: /pay <player> <amount>",
+                ["PayInvalidAmount"] = "Некорректная сумма.",
+                ["PaySelf"] = "Нельзя платить самому себе.",
+                ["PaySent"] = "Вы отправили {0} игроку {1}.",
+                ["PayReceived"] = "Вы получили {0} от {1}.",
+                ["InsurancePurchased"] = "Страховка медиков активна до: {0}",
+                ["BusinessRegistered"] = "Регистрация бизнеса активна до: {0}",
+                ["BusinessTaxCharged"] = "Еженедельный налог начислен: {0}",
+                ["BusinessTaxFailed"] = "Еженедельный налог не удалось списать: {0}",
 
                 ["ContractCreated"] = "Заказ #{0} создан. Награда: {1} scrap.",
                 ["ContractTaken"] = "Вы взяли заказ #{0}.",
@@ -341,6 +367,7 @@ namespace Oxide.Plugins
             public HashSet<string> Roles = new HashSet<string>(); // "mayor/police/judge/medic" etc
             public List<LicenseEntry> Licenses = new List<LicenseEntry>();
             public long InsuranceUntilUnix;
+            public long BusinessUntilUnix;
             public long CityBanUntilUnix;
             public int Strikes;
             public long LastDeathUnix;
@@ -623,6 +650,53 @@ namespace Oxide.Plugins
             private readonly HeliosRPCore _p;
             public EconomyService(HeliosRPCore p) { _p = p; }
 
+            private bool UseEconomics => _p._config.General.UseEconomicsPlugin && _p.Economics != null;
+
+            public bool TryWithdraw(ulong steamId, int amount)
+            {
+                if (amount <= 0) return true;
+
+                if (UseEconomics)
+                {
+                    var balObj = _p.Economics.Call("Balance", steamId);
+                    var bal = balObj != null ? Convert.ToDouble(balObj) : 0d;
+                    if (bal < amount) return false;
+                    _p.Economics.Call("Withdraw", steamId, (double)amount);
+                    return true;
+                }
+
+                var player = BasePlayer.FindByID(steamId);
+                if (player == null || !player.IsConnected) return false;
+                return TryChargeScrap(player, amount);
+            }
+
+            public bool TryDeposit(ulong steamId, int amount)
+            {
+                if (amount <= 0) return true;
+
+                if (UseEconomics)
+                {
+                    _p.Economics.Call("Deposit", steamId, (double)amount);
+                    return true;
+                }
+
+                var player = BasePlayer.FindByID(steamId);
+                if (player == null || !player.IsConnected) return false;
+                GiveScrap(player, amount);
+                return true;
+            }
+
+            public bool TryTransfer(ulong fromId, ulong toId, int amount)
+            {
+                if (!TryWithdraw(fromId, amount)) return false;
+                if (!TryDeposit(toId, amount))
+                {
+                    TryDeposit(fromId, amount);
+                    return false;
+                }
+                return true;
+            }
+
             public bool TryChargeScrap(BasePlayer player, int amount)
             {
                 if (amount <= 0) return true;
@@ -651,17 +725,7 @@ namespace Oxide.Plugins
             public void TreasuryAdd(int amount, string reason, string from = "system")
             {
                 _p._store.Treasury.BalanceScrap += amount;
-                _p._store.Treasury.RecentTransactions.Add(new Transaction
-                {
-                    From = from,
-                    To = "treasury",
-                    Amount = amount,
-                    Reason = reason
-                });
-
-                // Keep recent list bounded
-                if (_p._store.Treasury.RecentTransactions.Count > 200)
-                    _p._store.Treasury.RecentTransactions.RemoveRange(0, _p._store.Treasury.RecentTransactions.Count - 200);
+                _p.RecordTransaction(from, "treasury", amount, reason);
             }
         }
 
@@ -1009,6 +1073,7 @@ namespace Oxide.Plugins
             RegisterLang();
             LoadData();
             InitServices();
+            _transactionLogPath = Path.Combine(Interface.Oxide.DataFileSystem.Directory, $"{Name}_transactions.jsonl");
         }
 
         private void OnServerInitialized()
@@ -1035,6 +1100,12 @@ namespace Oxide.Plugins
             {
                 _licenses.ExpireTick();
                 SaveData(); // simple; later you may autosave less frequently
+            });
+
+            timer.Every(604800f, () =>
+            {
+                ApplyWeeklyBusinessTax();
+                SaveData();
             });
 
             // Spawn NPC fallbacks (stub)
@@ -1262,7 +1333,7 @@ namespace Oxide.Plugins
         [ChatCommand("rp")]
         private void CmdRP(BasePlayer player, string command, string[] args)
         {
-            player.ChatMessage(L("Prefix", player) + "Commands: /board, /licenses, /buylicense <type>, /war <declare|accept|status>");
+            player.ChatMessage(L("Prefix", player) + "Commands: /board, /licenses, /buylicense <type>, /pay <player> <amount>, /insurance buy, /business register, /war <declare|accept|status>");
         }
 
         [ChatCommand("war")]
@@ -1444,7 +1515,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (!_economy.TryChargeScrap(player, cost))
+            if (!_economy.TryWithdraw(player.userID, cost))
             {
                 Reply(player, "NotEnoughMoney", cost);
                 return;
@@ -1455,6 +1526,113 @@ namespace Oxide.Plugins
 
             var exp = DateTimeOffset.UtcNow.AddDays(days).ToString("yyyy-MM-dd HH:mm");
             Reply(player, "LicenseBought", type, exp);
+        }
+
+        [ChatCommand("pay")]
+        private void CmdPay(BasePlayer player, string command, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Reply(player, "PayUsage");
+                return;
+            }
+
+            var target = FindOnlinePlayer(args[0]);
+            if (target == null)
+            {
+                Reply(player, "PlayerNotFound", args[0]);
+                return;
+            }
+
+            if (target.userID == player.userID)
+            {
+                Reply(player, "PaySelf");
+                return;
+            }
+
+            if (!int.TryParse(args[1], out var amount) || amount <= 0)
+            {
+                Reply(player, "PayInvalidAmount");
+                return;
+            }
+
+            if (!_economy.TryTransfer(player.userID, target.userID, amount))
+            {
+                Reply(player, "NotEnoughMoney", amount);
+                return;
+            }
+
+            RecordTransaction(player.UserIDString, target.UserIDString, amount, "pay");
+            Reply(player, "PaySent", amount, target.displayName);
+            Reply(target, "PayReceived", amount, player.displayName);
+        }
+
+        [ChatCommand("insurance")]
+        private void CmdInsurance(BasePlayer player, string command, string[] args)
+        {
+            if (args.Length < 1 || !args[0].Equals("buy", StringComparison.OrdinalIgnoreCase))
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /insurance buy");
+                return;
+            }
+
+            if (!_config.Economy.Enabled)
+            {
+                player.ChatMessage(L("Prefix", player) + "Economy is disabled.");
+                return;
+            }
+
+            var cost = _config.Economy.MedicInsuranceCost;
+            if (!_economy.TryWithdraw(player.userID, cost))
+            {
+                Reply(player, "NotEnoughMoney", cost);
+                return;
+            }
+
+            var prof = GetOrCreateProfile(player.userID);
+            var now = NowUnix();
+            var duration = _config.Economy.MedicInsuranceDurationDays;
+            prof.InsuranceUntilUnix = Math.Max(prof.InsuranceUntilUnix, now) + duration * 86400L;
+
+            _economy.TreasuryAdd(cost, "medic_insurance", player.UserIDString);
+            SaveData();
+
+            var exp = DateTimeOffset.FromUnixTimeSeconds(prof.InsuranceUntilUnix).ToString("yyyy-MM-dd HH:mm");
+            Reply(player, "InsurancePurchased", exp);
+        }
+
+        [ChatCommand("business")]
+        private void CmdBusiness(BasePlayer player, string command, string[] args)
+        {
+            if (args.Length < 1 || !args[0].Equals("register", StringComparison.OrdinalIgnoreCase))
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /business register");
+                return;
+            }
+
+            if (!_config.Economy.Enabled)
+            {
+                player.ChatMessage(L("Prefix", player) + "Economy is disabled.");
+                return;
+            }
+
+            var cost = _config.Economy.BusinessRegistrationCost;
+            if (!_economy.TryWithdraw(player.userID, cost))
+            {
+                Reply(player, "NotEnoughMoney", cost);
+                return;
+            }
+
+            var prof = GetOrCreateProfile(player.userID);
+            var now = NowUnix();
+            var duration = _config.Economy.BusinessRegistrationDurationDays;
+            prof.BusinessUntilUnix = Math.Max(prof.BusinessUntilUnix, now) + duration * 86400L;
+
+            _economy.TreasuryAdd(cost, "business_registration", player.UserIDString);
+            SaveData();
+
+            var exp = DateTimeOffset.FromUnixTimeSeconds(prof.BusinessUntilUnix).ToString("yyyy-MM-dd HH:mm");
+            Reply(player, "BusinessRegistered", exp);
         }
 
         // UI commands
@@ -1659,6 +1837,78 @@ namespace Oxide.Plugins
 
         private static long NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         private static readonly string[] WeaponLicenseTypes = { "WeaponL1", "WeaponL2", "WeaponL3" };
+
+        private void RecordTransaction(string from, string to, int amount, string reason)
+        {
+            var tx = new Transaction
+            {
+                From = from,
+                To = to,
+                Amount = amount,
+                Reason = reason
+            };
+
+            _store.Treasury.RecentTransactions.Add(tx);
+            if (_store.Treasury.RecentTransactions.Count > 200)
+                _store.Treasury.RecentTransactions.RemoveRange(0, _store.Treasury.RecentTransactions.Count - 200);
+
+            AppendTransactionLog(tx);
+        }
+
+        private void AppendTransactionLog(Transaction tx)
+        {
+            if (string.IsNullOrEmpty(_transactionLogPath)) return;
+            try
+            {
+                var line = JsonConvert.SerializeObject(tx);
+                File.AppendAllText(_transactionLogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed to write transaction log: {ex.Message}");
+            }
+        }
+
+        private void ApplyWeeklyBusinessTax()
+        {
+            if (!_config.Economy.Enabled) return;
+
+            var tax = Mathf.CeilToInt(_config.Economy.BusinessRegistrationCost * _config.Economy.BusinessTaxRate);
+            if (tax <= 0) return;
+
+            var now = NowUnix();
+            foreach (var prof in _store.Players.Values)
+            {
+                if (prof.BusinessUntilUnix <= now) continue;
+
+                if (_economy.TryWithdraw(prof.SteamId, tax))
+                {
+                    _economy.TreasuryAdd(tax, "business_tax", prof.SteamId.ToString());
+                    var player = BasePlayer.FindByID(prof.SteamId);
+                    if (player != null && player.IsConnected)
+                        Reply(player, "BusinessTaxCharged", tax);
+                }
+                else
+                {
+                    var player = BasePlayer.FindByID(prof.SteamId);
+                    if (player != null && player.IsConnected)
+                        Reply(player, "BusinessTaxFailed", tax);
+                }
+            }
+        }
+
+        private BasePlayer FindOnlinePlayer(string nameOrId)
+        {
+            if (string.IsNullOrEmpty(nameOrId)) return null;
+
+            foreach (var p in BasePlayer.activePlayerList)
+            {
+                if (p.UserIDString == nameOrId) return p;
+            }
+
+            var lower = nameOrId.ToLowerInvariant();
+            return BasePlayer.activePlayerList.FirstOrDefault(p => p.displayName.ToLowerInvariant().Contains(lower));
+        }
 
         private PlayerProfile GetOrCreateProfile(ulong steamId)
         {
