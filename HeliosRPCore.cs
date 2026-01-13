@@ -39,7 +39,16 @@ namespace Oxide.Plugins
 
         private PluginConfig _config;
         private string _transactionLogPath;
-        private string _auditLogPath;
+        private AuditLogger _auditLogger;
+        private Timer _autosaveTimer;
+
+        private string _playersDataPath;
+        private string _factionsDataPath;
+        private string _contractsDataPath;
+        private string _casesDataPath;
+        private string _warsDataPath;
+        private string _zonesDataPath;
+        private string _treasuryDataPath;
 
         [PluginReference]
         private Plugin Economics;
@@ -54,11 +63,13 @@ namespace Oxide.Plugins
             public UISettings UI = new UISettings();
             public NPCSettings NPC = new NPCSettings();
             public PunishmentSettings Punishments = new PunishmentSettings();
+            public DiscordSettings Discord = new DiscordSettings();
 
             public class GeneralSettings
             {
                 public string Timezone = "Europe/Berlin";
                 public bool Debug = false;
+                public int AutosaveSeconds = 300;
 
                 // Currency:
                 public bool UseEconomicsPlugin = false; // optional integration
@@ -172,6 +183,20 @@ namespace Oxide.Plugins
                 public string JailPosition = "0 0 0";
                 public float JailRadius = 25f;
                 public bool BlockJailExit = true;
+            }
+
+            public class DiscordSettings
+            {
+                public bool Enabled = false;
+                public WebhookSettings Webhooks = new WebhookSettings();
+
+                public class WebhookSettings
+                {
+                    public string Court = "";
+                    public string Police = "";
+                    public string Raids = "";
+                    public string Economy = "";
+                }
             }
         }
 
@@ -374,6 +399,18 @@ namespace Oxide.Plugins
             public int NextCaseId = 1;
         }
 
+        private class ContractsData
+        {
+            public Dictionary<int, Contract> Contracts = new Dictionary<int, Contract>();
+            public int NextContractId = 1;
+        }
+
+        private class CasesData
+        {
+            public Dictionary<int, CaseFile> Cases = new Dictionary<int, CaseFile>();
+            public int NextCaseId = 1;
+        }
+
         private class Treasury
         {
             public int BalanceScrap = 0;
@@ -550,25 +587,102 @@ namespace Oxide.Plugins
             public int Priority;
         }
 
-        private DynamicConfigFile _dataFile;
+        private void InitializeDataPaths()
+        {
+            var dataDir = Interface.Oxide.DataFileSystem.Directory;
+            _playersDataPath = Path.Combine(dataDir, $"{Name}_Players.json");
+            _factionsDataPath = Path.Combine(dataDir, $"{Name}_Factions.json");
+            _contractsDataPath = Path.Combine(dataDir, $"{Name}_Contracts.json");
+            _casesDataPath = Path.Combine(dataDir, $"{Name}_Cases.json");
+            _warsDataPath = Path.Combine(dataDir, $"{Name}_Wars.json");
+            _zonesDataPath = Path.Combine(dataDir, $"{Name}_Zones.json");
+            _treasuryDataPath = Path.Combine(dataDir, $"{Name}_Treasury.json");
+        }
 
         private void LoadData()
         {
-            _dataFile = Interface.Oxide.DataFileSystem.GetFile(Name);
-            try
-            {
-                _store = _dataFile.ReadObject<DataStore>() ?? new DataStore();
-            }
-            catch
-            {
-                PrintWarning("Data file invalid; creating new store.");
-                _store = new DataStore();
-            }
+            InitializeDataPaths();
+
+            _store = new DataStore();
+            _store.Players = ReadJsonFile(_playersDataPath, new Dictionary<ulong, PlayerProfile>());
+            _store.Factions = ReadJsonFile(_factionsDataPath, new Dictionary<string, Faction>());
+
+            var contractsData = ReadJsonFile(_contractsDataPath, new ContractsData());
+            _store.Contracts = contractsData.Contracts ?? new Dictionary<int, Contract>();
+            _store.NextContractId = contractsData.NextContractId <= 0 ? 1 : contractsData.NextContractId;
+
+            var casesData = ReadJsonFile(_casesDataPath, new CasesData());
+            _store.Cases = casesData.Cases ?? new Dictionary<int, CaseFile>();
+            _store.NextCaseId = casesData.NextCaseId <= 0 ? 1 : casesData.NextCaseId;
+
+            _store.Wars = ReadJsonFile(_warsDataPath, new Dictionary<string, War>());
+            _store.Zones = ReadJsonFile(_zonesDataPath, new Dictionary<string, Zone>());
+            _store.Treasury = ReadJsonFile(_treasuryDataPath, new Treasury());
         }
 
         private void SaveData()
         {
-            _dataFile?.WriteObject(_store);
+            WriteJsonAtomic(_playersDataPath, _store.Players);
+            WriteJsonAtomic(_factionsDataPath, _store.Factions);
+            WriteJsonAtomic(_contractsDataPath, new ContractsData
+            {
+                Contracts = _store.Contracts,
+                NextContractId = _store.NextContractId
+            });
+            WriteJsonAtomic(_casesDataPath, new CasesData
+            {
+                Cases = _store.Cases,
+                NextCaseId = _store.NextCaseId
+            });
+            WriteJsonAtomic(_warsDataPath, _store.Wars);
+            WriteJsonAtomic(_zonesDataPath, _store.Zones);
+            WriteJsonAtomic(_treasuryDataPath, _store.Treasury);
+        }
+
+        private static T ReadJsonFile<T>(string path, T fallback) where T : class, new()
+        {
+            if (string.IsNullOrEmpty(path)) return fallback ?? new T();
+            try
+            {
+                if (!File.Exists(path)) return fallback ?? new T();
+                var json = File.ReadAllText(path);
+                if (string.IsNullOrWhiteSpace(json)) return fallback ?? new T();
+                var data = JsonConvert.DeserializeObject<T>(json);
+                return data ?? (fallback ?? new T());
+            }
+            catch (Exception ex)
+            {
+                Interface.Oxide.LogWarning($"[HeliosRPCore] Failed to read data file '{path}': {ex.Message}");
+                return fallback ?? new T();
+            }
+        }
+
+        private static void WriteJsonAtomic<T>(string path, T data)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+
+                var json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                var tempPath = path + ".tmp";
+                File.WriteAllText(tempPath, json);
+
+                if (File.Exists(path))
+                {
+                    File.Replace(tempPath, path, null);
+                }
+                else
+                {
+                    File.Move(tempPath, path);
+                }
+            }
+            catch (Exception ex)
+            {
+                Interface.Oxide.LogWarning($"[HeliosRPCore] Failed to write data file '{path}': {ex.Message}");
+            }
         }
 
         private string BuildWarKey(string attackerFactionId, string defenderFactionId)
@@ -1135,7 +1249,7 @@ namespace Oxide.Plugins
             LoadData();
             InitServices();
             _transactionLogPath = Path.Combine(Interface.Oxide.DataFileSystem.Directory, $"{Name}_transactions.jsonl");
-            _auditLogPath = Path.Combine(Interface.Oxide.DataFileSystem.Directory, $"{Name}_audit.jsonl");
+            _auditLogger = new AuditLogger(Path.Combine(Interface.Oxide.DataFileSystem.Directory, "HeliosRP_AuditLog.jsonl"));
         }
 
         private void OnServerInitialized()
@@ -1158,11 +1272,11 @@ namespace Oxide.Plugins
             }
 
             // Timers
-            timer.Every(60f, () =>
-            {
-                _licenses.ExpireTick();
-                SaveData(); // simple; later you may autosave less frequently
-            });
+            timer.Every(60f, () => _licenses.ExpireTick());
+
+            var autosaveSeconds = _config?.General?.AutosaveSeconds ?? 300;
+            if (autosaveSeconds < 30) autosaveSeconds = 30;
+            _autosaveTimer = timer.Every(autosaveSeconds, SaveData);
 
             timer.Every(604800f, () =>
             {
@@ -1301,6 +1415,7 @@ namespace Oxide.Plugins
                         info.damageTypes = new DamageTypeList();
                         info.HitMaterial = 0;
                         Reply(attacker, "ZoneRaidBlocked");
+                        SendDiscordWebhook(DiscordCategory.Raids, $"Raid blocked (zone): attacker={attacker.userID}, targetOwner={entity.OwnerID}, entity={entity.ShortPrefabName}");
                         return true;
                     }
                 }
@@ -1313,6 +1428,7 @@ namespace Oxide.Plugins
                 {
                     info.damageTypes = new DamageTypeList();
                     Reply(attacker, "RaidWindowClosed", nextInfo);
+                    SendDiscordWebhook(DiscordCategory.Raids, $"Raid blocked (window): attacker={attacker.userID}, entity={entity.ShortPrefabName}, next={nextInfo}");
                     return true;
                 }
 
@@ -1321,6 +1437,7 @@ namespace Oxide.Plugins
                 {
                     info.damageTypes = new DamageTypeList();
                     Reply(attacker, "RaidNoOwner");
+                    SendDiscordWebhook(DiscordCategory.Raids, $"Raid blocked (unknown owner): attacker={attacker.userID}, entity={entity.ShortPrefabName}");
                     return true;
                 }
 
@@ -1328,6 +1445,7 @@ namespace Oxide.Plugins
                 {
                     info.damageTypes = new DamageTypeList();
                     Reply(attacker, "RaidNoBasis");
+                    SendDiscordWebhook(DiscordCategory.Raids, $"Raid blocked (no basis): attacker={attacker.userID}, targetOwner={targetOwnerId}, entity={entity.ShortPrefabName}");
                     return true;
                 }
 
@@ -2706,6 +2824,42 @@ namespace Oxide.Plugins
         private static long NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         private static readonly string[] WeaponLicenseTypes = { "WeaponL1", "WeaponL2", "WeaponL3" };
 
+        private class AuditLogger
+        {
+            private readonly string _path;
+            private readonly object _lock = new object();
+
+            public AuditLogger(string path)
+            {
+                _path = path;
+            }
+
+            public void LogEvent(string type, object payload)
+            {
+                if (string.IsNullOrEmpty(_path)) return;
+                try
+                {
+                    var entry = new
+                    {
+                        id = Guid.NewGuid().ToString("N"),
+                        type,
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        payload
+                    };
+
+                    var line = JsonConvert.SerializeObject(entry);
+                    lock (_lock)
+                    {
+                        File.AppendAllText(_path, line + Environment.NewLine);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Interface.Oxide.LogWarning($"[HeliosRPCore] Failed to write audit log: {ex.Message}");
+                }
+            }
+        }
+
         private class AuditEntry
         {
             public string Id = Guid.NewGuid().ToString("N");
@@ -2726,7 +2880,8 @@ namespace Oxide.Plugins
                 Details = details
             };
 
-            AppendAuditLog(entry);
+            _auditLogger?.LogEvent("audit", entry);
+            TrySendDiscordForAudit(entry);
         }
 
         private void RecordTransaction(string from, string to, int amount, string reason)
@@ -2744,6 +2899,7 @@ namespace Oxide.Plugins
                 _store.Treasury.RecentTransactions.RemoveRange(0, _store.Treasury.RecentTransactions.Count - 200);
 
             AppendTransactionLog(tx);
+            SendDiscordWebhook(DiscordCategory.Economy, $"Transaction: {from} -> {to}, amount={amount}, reason={reason}");
         }
 
         private void AppendTransactionLog(Transaction tx)
@@ -2760,18 +2916,62 @@ namespace Oxide.Plugins
             }
         }
 
-        private void AppendAuditLog(AuditEntry entry)
+        private enum DiscordCategory
         {
-            if (string.IsNullOrEmpty(_auditLogPath)) return;
-            try
+            Court,
+            Police,
+            Raids,
+            Economy
+        }
+
+        private void TrySendDiscordForAudit(AuditEntry entry)
+        {
+            if (entry == null) return;
+            if (entry.Action.StartsWith("pd_", StringComparison.OrdinalIgnoreCase))
             {
-                var line = JsonConvert.SerializeObject(entry);
-                File.AppendAllText(_auditLogPath, line + Environment.NewLine);
+                SendDiscordWebhook(DiscordCategory.Police, $"Police event: {entry.Action}, actor={entry.ActorId}, target={entry.TargetId}, details={entry.Details}");
+                return;
             }
-            catch (Exception ex)
+            if (entry.Action.StartsWith("court_", StringComparison.OrdinalIgnoreCase))
             {
-                PrintWarning($"Failed to write audit log: {ex.Message}");
+                SendDiscordWebhook(DiscordCategory.Court, $"Court event: {entry.Action}, actor={entry.ActorId}, target={entry.TargetId}, details={entry.Details}");
             }
+        }
+
+        private void SendDiscordWebhook(DiscordCategory category, string message)
+        {
+            if (_config?.Discord == null || !_config.Discord.Enabled) return;
+            var url = GetDiscordWebhookUrl(category);
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            var payload = JsonConvert.SerializeObject(new { content = message });
+            var headers = new Dictionary<string, string>
+            {
+                ["Content-Type"] = "application/json"
+            };
+
+            webrequest.Enqueue(url, payload, (code, response) =>
+            {
+                if (code != 200 && code != 204)
+                {
+                    PrintWarning($"Discord webhook failed ({category}): {code} {response}");
+                }
+            }, this, Core.Libraries.RequestMethod.POST, headers);
+        }
+
+        private string GetDiscordWebhookUrl(DiscordCategory category)
+        {
+            var hooks = _config?.Discord?.Webhooks;
+            if (hooks == null) return null;
+
+            return category switch
+            {
+                DiscordCategory.Court => hooks.Court,
+                DiscordCategory.Police => hooks.Police,
+                DiscordCategory.Raids => hooks.Raids,
+                DiscordCategory.Economy => hooks.Economy,
+                _ => null
+            };
         }
 
         private bool TryParseVector3(string value, out Vector3 vec)
