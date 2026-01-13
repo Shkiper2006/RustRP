@@ -32,6 +32,7 @@ namespace Oxide.Plugins
         private const string UI_ROOT = "HRP_UI_ROOT";
         private const string UI_BOARD = "HRP_UI_BOARD";
         private const string UI_LICENSES = "HRP_UI_LICENSES";
+        private const string UI_NPC_DIALOG = "HRP_UI_NPC_DIALOG";
 
         #endregion
 
@@ -52,6 +53,9 @@ namespace Oxide.Plugins
 
         [PluginReference]
         private Plugin Economics;
+
+        [PluginReference]
+        private Plugin HumanNPC;
 
         private class PluginConfig
         {
@@ -158,6 +162,8 @@ namespace Oxide.Plugins
                 public bool Enabled = true;
                 public bool UseHumanNPC = false;          // integration stub
                 public bool FallbackTerminalMode = true;  // if no NPC plugin, use "terminal marker + UI"
+                public float FallbackUseDistance = 3f;
+                public string FallbackPrefab = "assets/prefabs/deployable/signs/sign.small.wood.prefab";
                 public List<NPCProfile> Profiles = new List<NPCProfile>
                 {
                     new NPCProfile { Id="ao_clerk", Role="mayor", DisplayName="AO Clerk", Position="0 0 0", RotationY=180, FallbackOnly=true },
@@ -288,8 +294,9 @@ namespace Oxide.Plugins
                 ["ContractPaymentFailed"] = "Contract #{0} payment failed; try again later.",
                 ["BoardAddUsage"] = "Usage: /board add <reward> <title> [description]",
 
-                ["NPC_FallbackNotice"] = "This role is currently unfilled — handled by an NPC.",
+                ["NPC_FallbackNotice"] = "This role is currently handled by a player.",
                 ["NPC_GoToPlayerRole"] = "A player with this role is online: {0}. Please contact them IC.",
+                ["NPC_GenericMenu"] = "This service is handled here. Please follow staff instructions or use relevant chat commands.",
             };
 
             var ru = new Dictionary<string, string>
@@ -351,8 +358,9 @@ namespace Oxide.Plugins
                 ["ContractPaymentFailed"] = "Не удалось выплатить заказ #{0}; попробуйте позже.",
                 ["BoardAddUsage"] = "Использование: /board add <reward> <title> [description]",
 
-                ["NPC_FallbackNotice"] = "Роль временно не занята игроком — обслуживает НПС.",
+                ["NPC_FallbackNotice"] = "Эту роль сейчас исполняет игрок.",
                 ["NPC_GoToPlayerRole"] = "Игрок с этой ролью онлайн: {0}. Обратитесь к нему IC.",
+                ["NPC_GenericMenu"] = "Эта служба обслуживается здесь. Следуйте инструкциям персонала или используйте команды чата.",
             };
 
             lang.RegisterMessages(en, this, "en");
@@ -1187,21 +1195,42 @@ namespace Oxide.Plugins
         private class NPCService
         {
             private readonly HeliosRPCore _p;
+            private readonly Dictionary<uint, PluginConfig.NPCSettings.NPCProfile> _fallbackEntities = new Dictionary<uint, PluginConfig.NPCSettings.NPCProfile>();
+            private readonly List<string> _humanNpcIds = new List<string>();
+            private readonly Dictionary<ulong, float> _fallbackUseCooldown = new Dictionary<ulong, float>();
             public NPCService(HeliosRPCore p) { _p = p; }
 
             public void SpawnFallbacksIfNeeded()
             {
                 if (!_p._config.NPC.Enabled) return;
 
-                // SKELETON:
-                // - If UseHumanNPC is true: call HumanNPC API to spawn configured NPCs (not implemented).
-                // - Else if FallbackTerminalMode: you can later spawn a "terminal marker" (e.g., static entity) and use raycast+Use button.
-                // For now, we only log configured profiles.
-                if (_p._config.General.Debug)
+                Cleanup();
+
+                var humanNpcAvailable = _p._config.NPC.UseHumanNPC && _p.HumanNPC != null;
+
+                if (humanNpcAvailable)
+                    SpawnHumanNPCs();
+
+                if (_p._config.NPC.FallbackTerminalMode)
+                    SpawnFallbackMarkers(humanNpcAvailable);
+            }
+
+            public void Cleanup()
+            {
+                foreach (var entry in _fallbackEntities)
                 {
-                    foreach (var n in _p._config.NPC.Profiles)
-                        _p.Puts($"[NPC] profile: {n.Id} role={n.Role} pos={n.Position} fallbackOnly={n.FallbackOnly}");
+                    var entity = BaseNetworkable.serverEntities.Find(entry.Key) as BaseEntity;
+                    if (entity != null && !entity.IsDestroyed)
+                        entity.Kill();
                 }
+                _fallbackEntities.Clear();
+                _fallbackUseCooldown.Clear();
+                _humanNpcIds.Clear();
+            }
+
+            public void ForgetFallback(uint netId)
+            {
+                _fallbackEntities.Remove(netId);
             }
 
             public bool IsRoleFilledByPlayer(string role, out string playerName)
@@ -1229,6 +1258,132 @@ namespace Oxide.Plugins
                     }
                 }
                 return false;
+            }
+
+            public bool TryHandleFallbackUse(BasePlayer player)
+            {
+                if (player == null || !_p._config.NPC.Enabled) return false;
+                if (_fallbackEntities.Count == 0) return false;
+
+                var now = Time.realtimeSinceStartup;
+                if (_fallbackUseCooldown.TryGetValue(player.userID, out var lastUse) && now - lastUse < 0.5f)
+                    return false;
+
+                var maxDistance = Mathf.Max(1f, _p._config.NPC.FallbackUseDistance);
+                var mask = LayerMask.GetMask("Deployed", "Construction", "Default");
+                if (mask == 0) mask = ~0;
+
+                if (!Physics.Raycast(player.eyes.HeadRay(), out var hit, maxDistance, mask))
+                    return false;
+
+                var entity = hit.GetEntity();
+                if (entity == null) return false;
+
+                if (!_fallbackEntities.TryGetValue(entity.net.ID, out var profile))
+                    return false;
+
+                _fallbackUseCooldown[player.userID] = now;
+
+                if (!string.IsNullOrEmpty(profile.Role) && IsRoleFilledByPlayer(profile.Role, out var playerName))
+                {
+                    _p.Reply(player, "NPC_FallbackNotice");
+                    if (!string.IsNullOrEmpty(playerName))
+                        _p.Reply(player, "NPC_GoToPlayerRole", playerName);
+                    return true;
+                }
+
+                _p.HandleNpcInteraction(player, profile);
+                return true;
+            }
+
+            private void SpawnHumanNPCs()
+            {
+                foreach (var profile in _p._config.NPC.Profiles)
+                {
+                    if (profile.FallbackOnly) continue;
+                    if (!_p.TryParseVector3(profile.Position, out var pos))
+                    {
+                        _p.PrintWarning($"[NPC] Invalid position for profile '{profile.Id}': {profile.Position}");
+                        continue;
+                    }
+
+                    var created = false;
+                    object result;
+
+                    result = _p.HumanNPC?.Call("CreateNPC", pos, profile.RotationY, profile.DisplayName);
+                    created = created || IsSuccessfulNpcResult(result);
+
+                    if (!created)
+                    {
+                        var payload = new Dictionary<string, object>
+                        {
+                            ["id"] = profile.Id,
+                            ["name"] = profile.DisplayName,
+                            ["position"] = pos,
+                            ["rotation"] = profile.RotationY
+                        };
+                        result = _p.HumanNPC?.Call("SpawnNPC", payload);
+                        created = created || IsSuccessfulNpcResult(result);
+                    }
+
+                    if (!created)
+                    {
+                        var payload = new Dictionary<string, object>
+                        {
+                            ["userID"] = profile.Id,
+                            ["displayName"] = profile.DisplayName,
+                            ["position"] = pos,
+                            ["rotation"] = profile.RotationY
+                        };
+                        result = _p.HumanNPC?.Call("AddNPC", payload);
+                        created = created || IsSuccessfulNpcResult(result);
+                    }
+
+                    if (!created)
+                    {
+                        _p.PrintWarning($"[NPC] HumanNPC API did not spawn profile '{profile.Id}'. Check HumanNPC API.");
+                    }
+                }
+            }
+
+            private void SpawnFallbackMarkers(bool humanNpcAvailable)
+            {
+                foreach (var profile in _p._config.NPC.Profiles)
+                {
+                    if (humanNpcAvailable && !profile.FallbackOnly) continue;
+                    if (!_p.TryParseVector3(profile.Position, out var pos))
+                    {
+                        _p.PrintWarning($"[NPC] Invalid fallback position for profile '{profile.Id}': {profile.Position}");
+                        continue;
+                    }
+
+                    var prefab = _p._config.NPC.FallbackPrefab;
+                    var entity = GameManager.server.CreateEntity(prefab, pos, Quaternion.Euler(0f, profile.RotationY, 0f), true);
+                    if (entity == null)
+                    {
+                        _p.PrintWarning($"[NPC] Failed to create fallback entity for profile '{profile.Id}' (prefab: {prefab}).");
+                        continue;
+                    }
+
+                    entity.enableSaving = false;
+                    entity.OwnerID = 0;
+                    entity.Spawn();
+
+                    _fallbackEntities[entity.net.ID] = profile;
+                }
+            }
+
+            private bool IsSuccessfulNpcResult(object result)
+            {
+                if (result == null) return false;
+                if (result is bool ok) return ok;
+                if (result is string id)
+                {
+                    if (!string.IsNullOrEmpty(id))
+                        _humanNpcIds.Add(id);
+                    return true;
+                }
+                return true;
             }
         }
 
@@ -1286,6 +1441,14 @@ namespace Oxide.Plugins
 
             // Spawn NPC fallbacks (stub)
             _npc.SpawnFallbacksIfNeeded();
+        }
+
+        private void Unload()
+        {
+            _autosaveTimer?.Destroy();
+            _npc?.Cleanup();
+            foreach (var player in BasePlayer.activePlayerList)
+                DestroyUI(player);
         }
 
         private void OnPlayerInit(BasePlayer player)
@@ -1351,6 +1514,13 @@ namespace Oxide.Plugins
 
                 _lastZoneType[player.userID] = zoneType;
             }
+        }
+
+        private void OnPlayerInput(BasePlayer player, InputState input)
+        {
+            if (player == null || input == null) return;
+            if (!input.WasJustPressed(BUTTON.USE)) return;
+            _npc?.TryHandleFallbackUse(player);
         }
 
         object OnPlayerAttack(BasePlayer attacker, HitInfo info)
@@ -1522,6 +1692,13 @@ namespace Oxide.Plugins
                 NotifyOwner(baseEntity, "ZoneTrapsBlocked");
                 NextTick(() => baseEntity.Kill());
             }
+        }
+
+        private void OnEntityKill(BaseNetworkable entity)
+        {
+            var baseEntity = entity as BaseEntity;
+            if (baseEntity == null) return;
+            _npc?.ForgetFallback(baseEntity.net.ID);
         }
 
         object CanLootEntity(BasePlayer player, BaseEntity target)
@@ -2646,6 +2823,7 @@ namespace Oxide.Plugins
             CuiHelper.DestroyUi(player, UI_ROOT);
             CuiHelper.DestroyUi(player, UI_BOARD);
             CuiHelper.DestroyUi(player, UI_LICENSES);
+            CuiHelper.DestroyUi(player, UI_NPC_DIALOG);
         }
 
         private void UI_ShowBoard(BasePlayer player)
@@ -2815,6 +2993,60 @@ namespace Oxide.Plugins
             }
 
             CuiHelper.AddUi(player, container);
+        }
+
+        private void UI_ShowNpcDialog(BasePlayer player, string title, string body)
+        {
+            var container = new CuiElementContainer();
+
+            container.Add(new CuiPanel
+            {
+                Image = { Color = _config.UI.PanelColor },
+                RectTransform = { AnchorMin = "0.30 0.30", AnchorMax = "0.70 0.70" },
+                CursorEnabled = true
+            }, "Overlay", UI_NPC_DIALOG);
+
+            container.Add(new CuiLabel
+            {
+                Text = { Text = title, FontSize = 18, Align = TextAnchor.MiddleCenter },
+                RectTransform = { AnchorMin = "0 0.85", AnchorMax = "1 1" }
+            }, UI_NPC_DIALOG, UI_NPC_DIALOG + "_TITLE");
+
+            container.Add(new CuiLabel
+            {
+                Text = { Text = body, FontSize = 12, Align = TextAnchor.UpperLeft },
+                RectTransform = { AnchorMin = "0.05 0.20", AnchorMax = "0.95 0.80" }
+            }, UI_NPC_DIALOG, UI_NPC_DIALOG + "_BODY");
+
+            container.Add(new CuiButton
+            {
+                Button = { Color = _config.UI.DangerColor, Command = "hrp.ui close" },
+                RectTransform = { AnchorMin = "0.82 0.05", AnchorMax = "0.95 0.15" },
+                Text = { Text = L("UI_Close", player), FontSize = 12, Align = TextAnchor.MiddleCenter }
+            }, UI_NPC_DIALOG, UI_NPC_DIALOG + "_CLOSE");
+
+            CuiHelper.AddUi(player, container);
+        }
+
+        private void HandleNpcInteraction(BasePlayer player, PluginConfig.NPCSettings.NPCProfile profile)
+        {
+            if (player == null || profile == null) return;
+            if (!_config.UI.Enabled) return;
+
+            DestroyUI(player);
+
+            switch (profile.Role?.ToLowerInvariant())
+            {
+                case "board":
+                    UI_ShowBoard(player);
+                    break;
+                case "mayor":
+                    UI_ShowLicenses(player);
+                    break;
+                default:
+                    UI_ShowNpcDialog(player, profile.DisplayName, L("NPC_GenericMenu", player));
+                    break;
+            }
         }
 
         #endregion
