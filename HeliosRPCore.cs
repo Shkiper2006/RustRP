@@ -107,6 +107,7 @@ namespace Oxide.Plugins
                 public LicenseDef WeaponL2 = new LicenseDef { Cost = 200, DurationDays = 7 };
                 public LicenseDef WeaponL3 = new LicenseDef { Cost = 400, DurationDays = 7 };
                 public LicenseDef TurretPermit = new LicenseDef { Cost = 300, DurationDays = 7 };
+                public List<int> ExpireNoticeHours = new List<int> { 24, 6 };
 
                 public class LicenseDef
                 {
@@ -216,6 +217,7 @@ namespace Oxide.Plugins
 
                 ["LicenseBought"] = "License {0} purchased. Valid until: {1}",
                 ["LicenseExpired"] = "License {0} has expired.",
+                ["LicenseExpiringSoon"] = "License {0} expires in {1}h.",
                 ["LicenseRequired"] = "Required license: {0}",
                 ["NotEnoughMoney"] = "Not enough scrap. Required: {0}",
 
@@ -258,6 +260,7 @@ namespace Oxide.Plugins
 
                 ["LicenseBought"] = "Лицензия {0} куплена. Действует до: {1}",
                 ["LicenseExpired"] = "Лицензия {0} истекла.",
+                ["LicenseExpiringSoon"] = "Лицензия {0} истекает через {1}ч.",
                 ["LicenseRequired"] = "Требуется лицензия: {0}",
                 ["NotEnoughMoney"] = "Недостаточно scrap. Нужно: {0}",
 
@@ -349,6 +352,7 @@ namespace Oxide.Plugins
         {
             public string Type; // Trade/Guard/WeaponL1/WeaponL2/WeaponL3/TurretPermit
             public long ExpiresAtUnix;
+            public List<int> ExpireNotifiedHours = new List<int>();
         }
 
         private class Faction
@@ -681,28 +685,65 @@ namespace Oxide.Plugins
                 var newExp = DateTimeOffset.UtcNow.AddDays(durationDays).ToUnixTimeSeconds();
 
                 if (existing == null)
-                    prof.Licenses.Add(new LicenseEntry { Type = type, ExpiresAtUnix = newExp });
+                    prof.Licenses.Add(new LicenseEntry { Type = type, ExpiresAtUnix = newExp, ExpireNotifiedHours = new List<int>() });
                 else
+                {
                     existing.ExpiresAtUnix = Math.Max(existing.ExpiresAtUnix, now) + durationDays * 86400;
+                    existing.ExpireNotifiedHours?.Clear();
+                }
             }
 
             public void ExpireTick()
             {
                 var now = NowUnix();
+                var noticeHours = _p._config.Licenses.ExpireNoticeHours ?? new List<int>();
+                var sortedNoticeHours = noticeHours
+                    .Where(h => h > 0)
+                    .Distinct()
+                    .OrderByDescending(h => h)
+                    .ToList();
+
                 foreach (var kv in _p._store.Players)
                 {
                     var prof = kv.Value;
                     if (prof.Licenses == null) continue;
 
-                    // remove expired (or keep for audit; here we remove)
-                    int before = prof.Licenses.Count;
-                    prof.Licenses.RemoveAll(l => l.ExpiresAtUnix <= now);
-                    if (before != prof.Licenses.Count)
+                    var expired = new List<LicenseEntry>();
+                    foreach (var license in prof.Licenses)
                     {
-                        // Optional: notify if online
+                        if (license.ExpiresAtUnix <= now)
+                        {
+                            expired.Add(license);
+                            continue;
+                        }
+
+                        if (sortedNoticeHours.Count == 0) continue;
+                        if (license.ExpireNotifiedHours == null)
+                            license.ExpireNotifiedHours = new List<int>();
+
+                        var secondsLeft = license.ExpiresAtUnix - now;
+                        foreach (var hours in sortedNoticeHours)
+                        {
+                            if (secondsLeft <= hours * 3600L && !license.ExpireNotifiedHours.Contains(hours))
+                            {
+                                var player = BasePlayer.FindByID(prof.SteamId);
+                                if (player != null && player.IsConnected)
+                                    _p.Reply(player, "LicenseExpiringSoon", license.Type, hours);
+                                license.ExpireNotifiedHours.Add(hours);
+                            }
+                        }
+                    }
+
+                    if (expired.Count > 0)
+                    {
                         var player = BasePlayer.FindByID(prof.SteamId);
                         if (player != null && player.IsConnected)
-                            _p.Reply(player, "LicenseExpired", "Some"); // TODO: per-license message if desired
+                        {
+                            foreach (var license in expired)
+                                _p.Reply(player, "LicenseExpired", license.Type);
+                        }
+                        foreach (var license in expired)
+                            prof.Licenses.Remove(license);
                     }
                 }
             }
@@ -1018,6 +1059,12 @@ namespace Oxide.Plugins
         {
             if (attacker == null || info == null) return null;
 
+            if (IsCitySafeWeaponRestricted(attacker))
+            {
+                Reply(attacker, "LicenseRequired", GetWeaponLicenseRequirementText());
+                return false;
+            }
+
             // Block combat in zone
             if (_config.Zones.Enabled)
             {
@@ -1034,6 +1081,19 @@ namespace Oxide.Plugins
                 }
             }
 
+            return null;
+        }
+
+        object OnActiveItemChanged(BasePlayer player, Item oldItem, Item newItem)
+        {
+            if (player == null || newItem == null) return null;
+            if (!_config.Zones.Enabled) return null;
+            if (_zones.GetZoneType(player.transform.position) != ZoneType.CITY_SAFE) return null;
+            if (!IsWeaponItem(newItem)) return null;
+            if (HasAnyWeaponLicense(player.userID)) return null;
+
+            Reply(player, "LicenseRequired", GetWeaponLicenseRequirementText());
+            player.UpdateActiveItem(0);
             return null;
         }
 
@@ -1091,6 +1151,35 @@ namespace Oxide.Plugins
             }
 
             return null;
+        }
+
+        private void OnEntityBuilt(Planner planner, GameObject go)
+        {
+            if (planner == null || go == null) return;
+            var player = planner.GetOwnerPlayer();
+            if (player == null) return;
+
+            var entity = go.ToBaseEntity();
+            if (entity == null) return;
+
+            if (IsTurretEntity(entity) || IsTrapEntity(entity))
+            {
+                if (!_licenses.HasLicense(player.userID, "TurretPermit"))
+                {
+                    Reply(player, "LicenseRequired", "TurretPermit");
+                    NextTick(() => entity.Kill());
+                }
+                return;
+            }
+
+            if (IsTradeEntity(entity))
+            {
+                if (!_licenses.HasLicense(player.userID, "Trade"))
+                {
+                    Reply(player, "LicenseRequired", "Trade");
+                    NextTick(() => entity.Kill());
+                }
+            }
         }
 
         object OnExplosiveThrown(BasePlayer player, BaseEntity entity, Item item)
@@ -1569,6 +1658,7 @@ namespace Oxide.Plugins
         #region === Helpers / Raid Entity Detection ===
 
         private static long NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        private static readonly string[] WeaponLicenseTypes = { "WeaponL1", "WeaponL2", "WeaponL3" };
 
         private PlayerProfile GetOrCreateProfile(ulong steamId)
         {
@@ -1598,6 +1688,25 @@ namespace Oxide.Plugins
             return false;
         }
 
+        private bool HasAnyWeaponLicense(ulong steamId)
+        {
+            return WeaponLicenseTypes.Any(type => _licenses.HasLicense(steamId, type));
+        }
+
+        private string GetWeaponLicenseRequirementText()
+        {
+            return string.Join("/", WeaponLicenseTypes);
+        }
+
+        private bool IsCitySafeWeaponRestricted(BasePlayer player)
+        {
+            if (player == null || !_config.Zones.Enabled) return false;
+            if (_zones.GetZoneType(player.transform.position) != ZoneType.CITY_SAFE) return false;
+            var item = player.GetActiveItem();
+            if (item == null || !IsWeaponItem(item)) return false;
+            return !HasAnyWeaponLicense(player.userID);
+        }
+
         private bool IsRaidRelevantEntity(BaseCombatEntity entity)
         {
             if (entity is BuildingBlock) return true;
@@ -1616,6 +1725,16 @@ namespace Oxide.Plugins
         private static bool IsTrapEntity(BaseEntity entity)
         {
             return entity is BearTrap || entity is Landmine || entity is TeslaCoil || entity is GunTrap;
+        }
+
+        private static bool IsWeaponItem(Item item)
+        {
+            return item?.info?.category == ItemCategory.Weapon;
+        }
+
+        private static bool IsTradeEntity(BaseEntity entity)
+        {
+            return entity is ShopFront || entity is VendingMachine;
         }
 
         private void NotifyOwner(BaseEntity entity, string key)
