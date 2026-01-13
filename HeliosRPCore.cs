@@ -264,6 +264,14 @@ namespace Oxide.Plugins
             player.ChatMessage(L("Prefix", player) + L(key, player, args));
         }
 
+        private bool IsFactionLeader(BasePlayer player, Faction faction)
+        {
+            if (player == null || faction == null) return false;
+            if (faction.LeaderId == player.userID) return true;
+            return permission.UserHasPermission(player.UserIDString, PERM_FACTION_LEADER)
+                || permission.UserHasPermission(player.UserIDString, PERM_ADMIN);
+        }
+
         #endregion
 
         #region === Data Store ===
@@ -333,7 +341,7 @@ namespace Oxide.Plugins
             public Dictionary<ulong, string> Members = new Dictionary<ulong, string>(); // steamId -> rank
         }
 
-        private enum ContractType { DELIVERY, GUARD, BUILD, INVESTIGATE, BOUNTY }
+        private enum ContractType { DELIVERY, GUARD, BUILD, INVESTIGATE, BOUNTY, RAID }
         private enum ContractStatus { OPEN, TAKEN, COMPLETED, CANCELLED, DISPUTED }
 
         private class Contract
@@ -350,6 +358,7 @@ namespace Oxide.Plugins
             public long CreatedAtUnix;
             public long DueAtUnix;
             public string LocationHint;
+            public ulong TargetOwnerId;
         }
 
         private enum CaseStatus { OPEN, HEARING_SCHEDULED, VERDICT, CLOSED }
@@ -367,6 +376,26 @@ namespace Oxide.Plugins
             public long CreatedAtUnix;
             public long ScheduleAtUnix;
             public Verdict Verdict;
+            public bool WarrantActive;
+            public ulong WarrantGrantedToId;
+            public ulong WarrantTargetId;
+            public long WarrantExpiresAtUnix;
+            public bool RetaliationActive;
+            public ulong RetaliationGrantedToId;
+            public ulong RetaliationTargetId;
+            public long RetaliationExpiresAtUnix;
+        }
+
+        private enum WarStatus { DECLARED, ACTIVE, ENDED }
+
+        private class War
+        {
+            public string Id;
+            public string AttackerFactionId;
+            public string DefenderFactionId;
+            public WarStatus Status;
+            public long StartAtUnix;
+            public long EndAtUnix;
         }
 
         private class Verdict
@@ -417,6 +446,21 @@ namespace Oxide.Plugins
         private void SaveData()
         {
             _dataFile?.WriteObject(_store);
+        }
+
+        private string BuildWarKey(string attackerFactionId, string defenderFactionId)
+        {
+            return $"{attackerFactionId}:{defenderFactionId}";
+        }
+
+        private bool TryGetWarBetween(string factionA, string factionB, out War war)
+        {
+            war = null;
+            if (string.IsNullOrEmpty(factionA) || string.IsNullOrEmpty(factionB)) return false;
+
+            if (_store.Wars.TryGetValue(BuildWarKey(factionA, factionB), out war)) return true;
+            if (_store.Wars.TryGetValue(BuildWarKey(factionB, factionA), out war)) return true;
+            return false;
         }
 
         #endregion
@@ -664,8 +708,13 @@ namespace Oxide.Plugins
 
             private bool IsAtWar(ulong a, ulong b)
             {
-                // TODO: replace with faction-based wars.
-                // For skeleton, returns false.
+                var factionA = _p._factions.GetFactionId(a);
+                var factionB = _p._factions.GetFactionId(b);
+                if (string.IsNullOrEmpty(factionA) || string.IsNullOrEmpty(factionB)) return false;
+
+                if (_p.TryGetWarBetween(factionA, factionB, out var war))
+                    return war.Status == WarStatus.ACTIVE;
+
                 return false;
             }
 
@@ -687,7 +736,7 @@ namespace Oxide.Plugins
             private readonly HeliosRPCore _p;
             public ContractService(HeliosRPCore p) { _p = p; }
 
-            public Contract Create(ulong customerId, string title, string desc, int reward, ContractType type)
+            public Contract Create(ulong customerId, string title, string desc, int reward, ContractType type, ulong targetOwnerId = 0)
             {
                 var id = _p._store.NextContractId++;
                 var c = new Contract
@@ -700,7 +749,8 @@ namespace Oxide.Plugins
                     Deposit = reward, // for MVP: deposit equals reward; you can change
                     Type = type,
                     Status = ContractStatus.OPEN,
-                    CreatedAtUnix = NowUnix()
+                    CreatedAtUnix = NowUnix(),
+                    TargetOwnerId = targetOwnerId
                 };
                 _p._store.Contracts[id] = c;
                 return c;
@@ -718,7 +768,16 @@ namespace Oxide.Plugins
 
             public bool HasActiveRaidContract(ulong attackerId, ulong targetOwnerId)
             {
-                // TODO: implement contract types that grant raid permission.
+                var now = NowUnix();
+                foreach (var c in _p._store.Contracts.Values)
+                {
+                    if (c.Type != ContractType.RAID) continue;
+                    if (c.Status != ContractStatus.TAKEN) continue;
+                    if (c.ContractorId != attackerId) continue;
+                    if (c.TargetOwnerId != targetOwnerId) continue;
+                    if (c.DueAtUnix != 0 && c.DueAtUnix <= now) continue;
+                    return true;
+                }
                 return false;
             }
         }
@@ -730,13 +789,31 @@ namespace Oxide.Plugins
 
             public bool HasActiveWarrant(ulong attackerId, ulong targetOwnerId)
             {
-                // TODO: implement warrants by case verdict or special record
+                var now = NowUnix();
+                foreach (var c in _p._store.Cases.Values)
+                {
+                    if (!c.WarrantActive) continue;
+                    if (c.Status == CaseStatus.CLOSED) continue;
+                    if (c.WarrantGrantedToId != attackerId) continue;
+                    if (c.WarrantTargetId != targetOwnerId) continue;
+                    if (c.WarrantExpiresAtUnix != 0 && c.WarrantExpiresAtUnix <= now) continue;
+                    return true;
+                }
                 return false;
             }
 
             public bool HasRetaliationPermit(ulong attackerId, ulong targetOwnerId)
             {
-                // TODO: implement case flag "raid-permit"
+                var now = NowUnix();
+                foreach (var c in _p._store.Cases.Values)
+                {
+                    if (!c.RetaliationActive) continue;
+                    if (c.Status == CaseStatus.CLOSED) continue;
+                    if (c.RetaliationGrantedToId != attackerId) continue;
+                    if (c.RetaliationTargetId != targetOwnerId) continue;
+                    if (c.RetaliationExpiresAtUnix != 0 && c.RetaliationExpiresAtUnix <= now) continue;
+                    return true;
+                }
                 return false;
             }
         }
@@ -933,7 +1010,154 @@ namespace Oxide.Plugins
         [ChatCommand("rp")]
         private void CmdRP(BasePlayer player, string command, string[] args)
         {
-            player.ChatMessage(L("Prefix", player) + "Commands: /board, /licenses, /buylicense <type>");
+            player.ChatMessage(L("Prefix", player) + "Commands: /board, /licenses, /buylicense <type>, /war <declare|accept|status>");
+        }
+
+        [ChatCommand("war")]
+        private void CmdWar(BasePlayer player, string command, string[] args)
+        {
+            if (args.Length == 0)
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /war declare <factionId> | /war accept <factionId> | /war status");
+                return;
+            }
+
+            var sub = args[0].ToLowerInvariant();
+            var playerFaction = _factions.GetFaction(player.userID);
+
+            switch (sub)
+            {
+                case "declare":
+                    {
+                        if (playerFaction == null)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "You are not in a faction.");
+                            return;
+                        }
+
+                        if (!IsFactionLeader(player, playerFaction))
+                        {
+                            Reply(player, "NoPermission");
+                            return;
+                        }
+
+                        if (args.Length < 2)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /war declare <factionId>");
+                            return;
+                        }
+
+                        var targetFactionId = args[1];
+                        if (!_store.Factions.TryGetValue(targetFactionId, out var targetFaction))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"Faction not found: {targetFactionId}");
+                            return;
+                        }
+
+                        if (targetFactionId == playerFaction.Id)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "You cannot declare war on your own faction.");
+                            return;
+                        }
+
+                        if (TryGetWarBetween(playerFaction.Id, targetFactionId, out var existing) && existing.Status != WarStatus.ENDED)
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"War already exists with {targetFactionId}.");
+                            return;
+                        }
+
+                        var key = BuildWarKey(playerFaction.Id, targetFactionId);
+                        var war = new War
+                        {
+                            Id = key,
+                            AttackerFactionId = playerFaction.Id,
+                            DefenderFactionId = targetFactionId,
+                            Status = WarStatus.DECLARED,
+                            StartAtUnix = NowUnix(),
+                            EndAtUnix = 0
+                        };
+                        _store.Wars[key] = war;
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"War declared on {targetFactionId}. Awaiting acceptance.");
+                        return;
+                    }
+
+                case "accept":
+                    {
+                        if (playerFaction == null)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "You are not in a faction.");
+                            return;
+                        }
+
+                        if (!IsFactionLeader(player, playerFaction))
+                        {
+                            Reply(player, "NoPermission");
+                            return;
+                        }
+
+                        if (args.Length < 2)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /war accept <factionId>");
+                            return;
+                        }
+
+                        var attackerFactionId = args[1];
+                        var key = BuildWarKey(attackerFactionId, playerFaction.Id);
+                        if (!_store.Wars.TryGetValue(key, out var war))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"No war declaration found from {attackerFactionId}.");
+                            return;
+                        }
+
+                        if (war.Status == WarStatus.ACTIVE)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "War is already active.");
+                            return;
+                        }
+
+                        war.Status = WarStatus.ACTIVE;
+                        war.StartAtUnix = NowUnix();
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"War with {attackerFactionId} is now active.");
+                        return;
+                    }
+
+                case "status":
+                    {
+                        if (playerFaction == null)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "You are not in a faction.");
+                            return;
+                        }
+
+                        var wars = _store.Wars.Values
+                            .Where(w => w.AttackerFactionId == playerFaction.Id || w.DefenderFactionId == playerFaction.Id)
+                            .ToList();
+
+                        if (wars.Count == 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "No wars for your faction.");
+                            return;
+                        }
+
+                        player.ChatMessage(L("Prefix", player) + "War status:");
+                        foreach (var war in wars)
+                        {
+                            var otherFactionId = war.AttackerFactionId == playerFaction.Id
+                                ? war.DefenderFactionId
+                                : war.AttackerFactionId;
+                            player.ChatMessage($"- vs {otherFactionId}: {war.Status}");
+                        }
+                        return;
+                    }
+
+                default:
+                    player.ChatMessage(L("Prefix", player) + "Usage: /war declare <factionId> | /war accept <factionId> | /war status");
+                    return;
+            }
         }
 
         [ChatCommand("board")]
