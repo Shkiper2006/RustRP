@@ -85,6 +85,18 @@ namespace Oxide.Plugins
                 public bool CitySafeBlocksCombat = true;
                 public bool CitySafeBlocksRaidDamage = true;
                 public bool CitySafeBlocksTheft = true;
+                public bool CitySafeBlocksTurrets = true;
+                public bool CitySafeBlocksTraps = true;
+                public bool CitySafeBlocksLoot = true;
+                public bool CitySafeBlocksExplosives = true;
+
+                public bool SpecialEventBlocksCombat = true;
+                public bool SpecialEventBlocksRaidDamage = true;
+                public bool SpecialEventBlocksTheft = true;
+                public bool SpecialEventBlocksTurrets = true;
+                public bool SpecialEventBlocksTraps = true;
+                public bool SpecialEventBlocksLoot = true;
+                public bool SpecialEventBlocksExplosives = true;
             }
 
             public class LicenseSettings
@@ -192,7 +204,12 @@ namespace Oxide.Plugins
                 ["UI_ContractStatus_DISPUTED"] = "DISPUTED",
 
                 ["ZoneCombatBlocked"] = "Combat is blocked here (safe zone).",
-                ["RaidBlockedCity"] = "Raiding is forbidden in the city safe zone.",
+                ["ZoneLootBlocked"] = "Looting is blocked in this zone.",
+                ["ZoneTheftBlocked"] = "Theft is blocked in this zone.",
+                ["ZoneExplosivesBlocked"] = "Explosives are blocked in this zone.",
+                ["ZoneTurretsBlocked"] = "Turrets are blocked in this zone.",
+                ["ZoneTrapsBlocked"] = "Traps are blocked in this zone.",
+                ["ZoneRaidBlocked"] = "Raid damage is blocked in this zone.",
                 ["RaidWindowClosed"] = "Raid window is closed. Next: {0}",
                 ["RaidNoBasis"] = "No raiding basis. Required: WAR/CONTRACT/WARRANT/RETALIATION.",
                 ["RaidNoOwner"] = "Owner could not be determined; raiding is blocked by server rules.",
@@ -229,7 +246,12 @@ namespace Oxide.Plugins
                 ["UI_ContractStatus_DISPUTED"] = "СПОР",
 
                 ["ZoneCombatBlocked"] = "Здесь запрещены атаки и стрельба (безопасная зона).",
-                ["RaidBlockedCity"] = "Рейды запрещены в городской безопасной зоне.",
+                ["ZoneLootBlocked"] = "Лут запрещен в этой зоне.",
+                ["ZoneTheftBlocked"] = "Кража запрещена в этой зоне.",
+                ["ZoneExplosivesBlocked"] = "В этой зоне запрещены взрывчатые.",
+                ["ZoneTurretsBlocked"] = "В этой зоне запрещены турели.",
+                ["ZoneTrapsBlocked"] = "В этой зоне запрещены ловушки.",
+                ["ZoneRaidBlocked"] = "В этой зоне запрещен урон для рейда.",
                 ["RaidWindowClosed"] = "Рейд-окно закрыто. Следующее: {0}",
                 ["RaidNoBasis"] = "Нет основания для рейда. Нужно: WAR/CONTRACT/WARRANT/RETALIATION.",
                 ["RaidNoOwner"] = "Владелец не определён; рейд заблокирован правилами сервера.",
@@ -416,6 +438,18 @@ namespace Oxide.Plugins
 
         private enum ZoneType { CITY_SAFE, SUBURB, WILD, SPECIAL_EVENT }
         private enum ZoneShape { RADIUS /* polygon later */ }
+        [Flags]
+        private enum ZoneBlockFlags
+        {
+            None = 0,
+            Combat = 1 << 0,
+            Raid = 1 << 1,
+            Theft = 1 << 2,
+            Turrets = 1 << 3,
+            Traps = 1 << 4,
+            Loot = 1 << 5,
+            Explosives = 1 << 6
+        }
 
         private class Zone
         {
@@ -495,21 +529,25 @@ namespace Oxide.Plugins
 
             public bool IsCitySafe(Vector3 pos)
             {
-                // Simple radius zones; priority/polygons later.
-                foreach (var z in _p._store.Zones.Values.OrderByDescending(x => x.Priority))
-                {
-                    if (z.Shape == ZoneShape.RADIUS)
-                    {
-                        if (Vector3.Distance(pos, z.Center) <= z.Radius)
-                            return z.Type == ZoneType.CITY_SAFE || z.Type == ZoneType.SPECIAL_EVENT;
-                    }
-                }
-                return false;
+                return GetZoneType(pos) == ZoneType.CITY_SAFE || GetZoneType(pos) == ZoneType.SPECIAL_EVENT;
             }
 
             public ZoneType GetZoneType(Vector3 pos)
             {
-                ZoneType? best = null;
+                var zone = GetBestZone(pos);
+                return zone?.Type ?? ZoneType.WILD;
+            }
+
+            public ZoneBlockFlags GetZoneFlags(Vector3 pos)
+            {
+                var zone = GetBestZone(pos);
+                if (zone == null) return ZoneBlockFlags.None;
+                return GetFlagsForZoneType(zone.Type);
+            }
+
+            private Zone GetBestZone(Vector3 pos)
+            {
+                Zone best = null;
                 int bestPr = int.MinValue;
 
                 foreach (var z in _p._store.Zones.Values)
@@ -517,14 +555,62 @@ namespace Oxide.Plugins
                     if (z.Shape != ZoneShape.RADIUS) continue;
                     if (Vector3.Distance(pos, z.Center) > z.Radius) continue;
 
-                    if (z.Priority > bestPr)
+                    var effectivePriority = z.Priority + (z.Type == ZoneType.SPECIAL_EVENT ? 10000 : 0);
+                    if (effectivePriority > bestPr)
                     {
-                        bestPr = z.Priority;
-                        best = z.Type;
+                        bestPr = effectivePriority;
+                        best = z;
                     }
                 }
 
-                return best ?? ZoneType.WILD;
+                return best;
+            }
+
+            private ZoneBlockFlags GetFlagsForZoneType(ZoneType type)
+            {
+                switch (type)
+                {
+                    case ZoneType.CITY_SAFE:
+                        return BuildFlags(
+                            _p._config.Zones.CitySafeBlocksCombat,
+                            _p._config.Zones.CitySafeBlocksRaidDamage,
+                            _p._config.Zones.CitySafeBlocksTheft,
+                            _p._config.Zones.CitySafeBlocksTurrets,
+                            _p._config.Zones.CitySafeBlocksTraps,
+                            _p._config.Zones.CitySafeBlocksLoot,
+                            _p._config.Zones.CitySafeBlocksExplosives);
+                    case ZoneType.SPECIAL_EVENT:
+                        return BuildFlags(
+                            _p._config.Zones.SpecialEventBlocksCombat,
+                            _p._config.Zones.SpecialEventBlocksRaidDamage,
+                            _p._config.Zones.SpecialEventBlocksTheft,
+                            _p._config.Zones.SpecialEventBlocksTurrets,
+                            _p._config.Zones.SpecialEventBlocksTraps,
+                            _p._config.Zones.SpecialEventBlocksLoot,
+                            _p._config.Zones.SpecialEventBlocksExplosives);
+                    default:
+                        return ZoneBlockFlags.None;
+                }
+            }
+
+            private static ZoneBlockFlags BuildFlags(
+                bool combat,
+                bool raid,
+                bool theft,
+                bool turrets,
+                bool traps,
+                bool loot,
+                bool explosives)
+            {
+                var flags = ZoneBlockFlags.None;
+                if (combat) flags |= ZoneBlockFlags.Combat;
+                if (raid) flags |= ZoneBlockFlags.Raid;
+                if (theft) flags |= ZoneBlockFlags.Theft;
+                if (turrets) flags |= ZoneBlockFlags.Turrets;
+                if (traps) flags |= ZoneBlockFlags.Traps;
+                if (loot) flags |= ZoneBlockFlags.Loot;
+                if (explosives) flags |= ZoneBlockFlags.Explosives;
+                return flags;
             }
         }
 
@@ -932,11 +1018,16 @@ namespace Oxide.Plugins
         {
             if (attacker == null || info == null) return null;
 
-            // Block combat in CITY_SAFE
-            if (_config.Zones.Enabled && _config.Zones.CitySafeBlocksCombat)
+            // Block combat in zone
+            if (_config.Zones.Enabled)
             {
-                var zType = _zones.GetZoneType(attacker.transform.position);
-                if (zType == ZoneType.CITY_SAFE)
+                var attackerFlags = _zones.GetZoneFlags(attacker.transform.position);
+                var targetFlags = ZoneBlockFlags.None;
+                var targetEntity = info.HitEntity;
+                if (targetEntity != null)
+                    targetFlags = _zones.GetZoneFlags(targetEntity.transform.position);
+
+                if (HasFlag(attackerFlags, ZoneBlockFlags.Combat) || HasFlag(targetFlags, ZoneBlockFlags.Combat))
                 {
                     Reply(attacker, "ZoneCombatBlocked");
                     return false;
@@ -952,21 +1043,20 @@ namespace Oxide.Plugins
             var attacker = info.InitiatorPlayer;
             if (attacker == null) return null;
 
-            // 1) Hard block any combat/raid in CITY_SAFE (optional)
+            // 1) Hard block any raid damage in zone
             if (_config.Zones.Enabled)
             {
-                var entityZone = _zones.GetZoneType(entity.transform.position);
-                var attackerZone = _zones.GetZoneType(attacker.transform.position);
+                var entityFlags = _zones.GetZoneFlags(entity.transform.position);
+                var attackerFlags = _zones.GetZoneFlags(attacker.transform.position);
 
-                if (_config.Zones.CitySafeBlocksRaidDamage &&
-                    (entityZone == ZoneType.CITY_SAFE || attackerZone == ZoneType.CITY_SAFE))
+                if ((HasFlag(entityFlags, ZoneBlockFlags.Raid) || HasFlag(attackerFlags, ZoneBlockFlags.Raid)))
                 {
                     // If this is building/door damage via raid means, block.
                     if (IsRaidRelevantEntity(entity) && IsRaidDamage(info))
                     {
                         info.damageTypes = new DamageTypeList();
                         info.HitMaterial = 0;
-                        Reply(attacker, "RaidBlockedCity");
+                        Reply(attacker, "ZoneRaidBlocked");
                         return true;
                     }
                 }
@@ -1001,6 +1091,79 @@ namespace Oxide.Plugins
             }
 
             return null;
+        }
+
+        object OnExplosiveThrown(BasePlayer player, BaseEntity entity, Item item)
+        {
+            if (player == null) return null;
+            if (!_config.Zones.Enabled) return null;
+
+            var flags = _zones.GetZoneFlags(player.transform.position);
+            if (HasFlag(flags, ZoneBlockFlags.Explosives))
+            {
+                Reply(player, "ZoneExplosivesBlocked");
+                return false;
+            }
+
+            return null;
+        }
+
+        private void OnEntitySpawned(BaseNetworkable entity)
+        {
+            if (!_config.Zones.Enabled) return;
+            if (entity == null) return;
+
+            var baseEntity = entity as BaseEntity;
+            if (baseEntity == null) return;
+
+            if (!IsTurretEntity(baseEntity) && !IsTrapEntity(baseEntity)) return;
+
+            var flags = _zones.GetZoneFlags(baseEntity.transform.position);
+            if (IsTurretEntity(baseEntity) && HasFlag(flags, ZoneBlockFlags.Turrets))
+            {
+                NotifyOwner(baseEntity, "ZoneTurretsBlocked");
+                NextTick(() => baseEntity.Kill());
+                return;
+            }
+
+            if (IsTrapEntity(baseEntity) && HasFlag(flags, ZoneBlockFlags.Traps))
+            {
+                NotifyOwner(baseEntity, "ZoneTrapsBlocked");
+                NextTick(() => baseEntity.Kill());
+            }
+        }
+
+        object CanLootEntity(BasePlayer player, BaseEntity target)
+        {
+            if (player == null || target == null) return null;
+            if (!_config.Zones.Enabled) return null;
+
+            var flags = _zones.GetZoneFlags(player.transform.position) | _zones.GetZoneFlags(target.transform.position);
+            if (HasFlag(flags, ZoneBlockFlags.Loot))
+            {
+                Reply(player, "ZoneLootBlocked");
+                return false;
+            }
+
+            if (HasFlag(flags, ZoneBlockFlags.Theft))
+            {
+                Reply(player, "ZoneTheftBlocked");
+                return false;
+            }
+
+            return null;
+        }
+
+        private void OnLootEntity(BasePlayer player, BaseEntity target)
+        {
+            if (player == null || target == null) return;
+            if (!_config.Zones.Enabled) return;
+
+            var flags = _zones.GetZoneFlags(player.transform.position) | _zones.GetZoneFlags(target.transform.position);
+            if (HasFlag(flags, ZoneBlockFlags.Loot) || HasFlag(flags, ZoneBlockFlags.Theft))
+            {
+                player.EndLooting();
+            }
         }
 
         #endregion
@@ -1445,6 +1608,24 @@ namespace Oxide.Plugins
             return false;
         }
 
+        private static bool IsTurretEntity(BaseEntity entity)
+        {
+            return entity is AutoTurret || entity is FlameTurret;
+        }
+
+        private static bool IsTrapEntity(BaseEntity entity)
+        {
+            return entity is BearTrap || entity is Landmine || entity is TeslaCoil || entity is GunTrap;
+        }
+
+        private void NotifyOwner(BaseEntity entity, string key)
+        {
+            if (entity == null || entity.OwnerID == 0) return;
+            var owner = BasePlayer.FindByID(entity.OwnerID);
+            if (owner != null && owner.IsConnected)
+                Reply(owner, key);
+        }
+
         private bool IsRaidDamage(HitInfo info)
         {
             if (info == null) return false;
@@ -1478,6 +1659,8 @@ namespace Oxide.Plugins
             catch { }
             return 0;
         }
+
+        private static bool HasFlag(ZoneBlockFlags value, ZoneBlockFlags flag) => (value & flag) == flag;
 
         #endregion
 
