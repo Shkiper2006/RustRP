@@ -205,6 +205,9 @@ namespace Oxide.Plugins
                 ["UI_Close"] = "Close",
                 ["UI_Take"] = "Take",
                 ["UI_Info"] = "Info",
+                ["UI_Add"] = "Add",
+                ["UI_Complete"] = "Complete",
+                ["UI_Dispute"] = "Dispute",
                 ["UI_Buy"] = "Buy",
                 ["UI_Renew"] = "Renew",
                 ["UI_ContractStatus_OPEN"] = "OPEN",
@@ -242,6 +245,14 @@ namespace Oxide.Plugins
                 ["ContractTaken"] = "You have taken contract #{0}.",
                 ["ContractCompleted"] = "Contract #{0} completed. Payment sent.",
                 ["ContractDisputed"] = "Contract #{0} dispute sent to court.",
+                ["ContractNotFound"] = "Contract #{0} not found.",
+                ["ContractNoPermission"] = "You cannot perform this action on contract #{0}.",
+                ["ContractNoContractor"] = "Contract #{0} has no contractor.",
+                ["ContractAlreadyPaid"] = "Contract #{0} was already paid.",
+                ["ContractCannotComplete"] = "Contract #{0} cannot be completed in its current state.",
+                ["ContractCannotDispute"] = "Contract #{0} cannot be disputed in its current state.",
+                ["ContractPaymentFailed"] = "Contract #{0} payment failed; try again later.",
+                ["BoardAddUsage"] = "Usage: /board add <reward> <title> [description]",
 
                 ["NPC_FallbackNotice"] = "This role is currently unfilled — handled by an NPC.",
                 ["NPC_GoToPlayerRole"] = "A player with this role is online: {0}. Please contact them IC.",
@@ -257,6 +268,9 @@ namespace Oxide.Plugins
                 ["UI_Close"] = "Закрыть",
                 ["UI_Take"] = "Взять",
                 ["UI_Info"] = "Инфо",
+                ["UI_Add"] = "Добавить",
+                ["UI_Complete"] = "Завершить",
+                ["UI_Dispute"] = "Спор",
                 ["UI_Buy"] = "Купить",
                 ["UI_Renew"] = "Продлить",
                 ["UI_ContractStatus_OPEN"] = "ОТКРЫТ",
@@ -294,6 +308,14 @@ namespace Oxide.Plugins
                 ["ContractTaken"] = "Вы взяли заказ #{0}.",
                 ["ContractCompleted"] = "Заказ #{0} завершён. Выплата произведена.",
                 ["ContractDisputed"] = "Спор по заказу #{0} отправлен в суд.",
+                ["ContractNotFound"] = "Заказ #{0} не найден.",
+                ["ContractNoPermission"] = "Нельзя выполнить действие для заказа #{0}.",
+                ["ContractNoContractor"] = "У заказа #{0} нет исполнителя.",
+                ["ContractAlreadyPaid"] = "Заказ #{0} уже был оплачен.",
+                ["ContractCannotComplete"] = "Заказ #{0} нельзя завершить в текущем статусе.",
+                ["ContractCannotDispute"] = "Заказ #{0} нельзя оспорить в текущем статусе.",
+                ["ContractPaymentFailed"] = "Не удалось выплатить заказ #{0}; попробуйте позже.",
+                ["BoardAddUsage"] = "Использование: /board add <reward> <title> [description]",
 
                 ["NPC_FallbackNotice"] = "Роль временно не занята игроком — обслуживает НПС.",
                 ["NPC_GoToPlayerRole"] = "Игрок с этой ролью онлайн: {0}. Обратитесь к нему IC.",
@@ -406,6 +428,7 @@ namespace Oxide.Plugins
             public ulong ContractorId; // 0 if none
             public int Reward;
             public int Deposit;
+            public bool PaidOut;
             public ContractType Type;
             public ContractStatus Status;
             public long CreatedAtUnix;
@@ -419,6 +442,7 @@ namespace Oxide.Plugins
         private class CaseFile
         {
             public int Id;
+            public int ContractId;
             public ulong SuspectId;
             public ulong ComplainantId;
             public ulong JudgeId;
@@ -927,7 +951,7 @@ namespace Oxide.Plugins
             private readonly HeliosRPCore _p;
             public ContractService(HeliosRPCore p) { _p = p; }
 
-            public Contract Create(ulong customerId, string title, string desc, int reward, ContractType type, ulong targetOwnerId = 0)
+            public Contract Create(ulong customerId, string title, string desc, int reward, int deposit, ContractType type, ulong targetOwnerId = 0)
             {
                 var id = _p._store.NextContractId++;
                 var c = new Contract
@@ -937,7 +961,7 @@ namespace Oxide.Plugins
                     Description = desc,
                     CustomerId = customerId,
                     Reward = reward,
-                    Deposit = reward, // for MVP: deposit equals reward; you can change
+                    Deposit = deposit,
                     Type = type,
                     Status = ContractStatus.OPEN,
                     CreatedAtUnix = NowUnix(),
@@ -1486,9 +1510,30 @@ namespace Oxide.Plugins
         [ChatCommand("board")]
         private void CmdBoard(BasePlayer player, string command, string[] args)
         {
-            if (!_config.UI.Enabled) return;
-            DestroyUI(player);
-            UI_ShowBoard(player);
+            if (args.Length == 0)
+            {
+                if (!_config.UI.Enabled) return;
+                DestroyUI(player);
+                UI_ShowBoard(player);
+                return;
+            }
+
+            var sub = args[0].ToLowerInvariant();
+            switch (sub)
+            {
+                case "add":
+                    HandleBoardAdd(player, args);
+                    return;
+                case "complete":
+                    HandleBoardComplete(player, args);
+                    return;
+                case "dispute":
+                    HandleBoardDispute(player, args);
+                    return;
+                default:
+                    player.ChatMessage(L("Prefix", player) + L("BoardAddUsage", player));
+                    return;
+            }
         }
 
         [ChatCommand("licenses")]
@@ -1635,6 +1680,205 @@ namespace Oxide.Plugins
             Reply(player, "BusinessRegistered", exp);
         }
 
+        private void HandleBoardAdd(BasePlayer player, string[] args)
+        {
+            if (args.Length < 3)
+            {
+                Reply(player, "BoardAddUsage");
+                return;
+            }
+
+            if (!int.TryParse(args[1], out var reward) || reward <= 0)
+            {
+                Reply(player, "PayInvalidAmount");
+                return;
+            }
+
+            var title = args[2];
+            var desc = args.Length > 3 ? string.Join(" ", args.Skip(3)) : "";
+
+            if (!_economy.TryWithdraw(player.userID, reward))
+            {
+                Reply(player, "NotEnoughMoney", reward);
+                return;
+            }
+
+            var contract = _contracts.Create(player.userID, title, desc, reward, reward, ContractType.DELIVERY);
+            RecordTransaction(player.UserIDString, "contract_deposit", reward, $"contract_deposit:{contract.Id}");
+            SaveData();
+
+            Reply(player, "ContractCreated", contract.Id, reward);
+        }
+
+        private void HandleBoardComplete(BasePlayer player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /board complete <id>");
+                return;
+            }
+
+            if (!int.TryParse(args[1], out var id) || id <= 0)
+            {
+                Reply(player, "PayInvalidAmount");
+                return;
+            }
+
+            TryCompleteContract(player, id);
+        }
+
+        private void HandleBoardDispute(BasePlayer player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /board dispute <id>");
+                return;
+            }
+
+            if (!int.TryParse(args[1], out var id) || id <= 0)
+            {
+                Reply(player, "PayInvalidAmount");
+                return;
+            }
+
+            TryDisputeContract(player, id);
+        }
+
+        private void TryCompleteContract(BasePlayer player, int id)
+        {
+            if (!_store.Contracts.TryGetValue(id, out var c))
+            {
+                Reply(player, "ContractNotFound", id);
+                return;
+            }
+
+            if (!CanCompleteContract(player, c))
+            {
+                Reply(player, "ContractNoPermission", id);
+                return;
+            }
+
+            if (c.Status == ContractStatus.DISPUTED || c.Status == ContractStatus.CANCELLED)
+            {
+                Reply(player, "ContractCannotComplete", id);
+                return;
+            }
+
+            if (c.ContractorId == 0)
+            {
+                Reply(player, "ContractNoContractor", id);
+                return;
+            }
+
+            if (c.PaidOut)
+            {
+                Reply(player, "ContractAlreadyPaid", id);
+                return;
+            }
+
+            if (c.Status != ContractStatus.TAKEN && c.Status != ContractStatus.COMPLETED)
+            {
+                Reply(player, "ContractCannotComplete", id);
+                return;
+            }
+
+            c.Status = ContractStatus.COMPLETED;
+            if (_economy.TryDeposit(c.ContractorId, c.Reward))
+            {
+                c.PaidOut = true;
+                RecordTransaction("contract_escrow", c.ContractorId.ToString(), c.Reward, $"contract_payout:{c.Id}");
+                Reply(player, "ContractCompleted", id);
+            }
+            else
+            {
+                Reply(player, "ContractPaymentFailed", id);
+            }
+
+            SaveData();
+        }
+
+        private void TryDisputeContract(BasePlayer player, int id)
+        {
+            if (!_store.Contracts.TryGetValue(id, out var c))
+            {
+                Reply(player, "ContractNotFound", id);
+                return;
+            }
+
+            if (!CanDisputeContract(player, c))
+            {
+                Reply(player, "ContractNoPermission", id);
+                return;
+            }
+
+            if (c.Status == ContractStatus.OPEN || c.Status == ContractStatus.CANCELLED || c.Status == ContractStatus.DISPUTED)
+            {
+                Reply(player, "ContractCannotDispute", id);
+                return;
+            }
+
+            var suspectId = ResolveDisputeSuspect(player, c);
+            if (suspectId == 0)
+            {
+                Reply(player, "ContractNoContractor", id);
+                return;
+            }
+
+            var caseId = _store.NextCaseId++;
+            var caseFile = new CaseFile
+            {
+                Id = caseId,
+                ContractId = c.Id,
+                ComplainantId = player.userID,
+                SuspectId = suspectId,
+                Status = CaseStatus.OPEN,
+                CreatedAtUnix = NowUnix(),
+                Charges = new List<string> { $"Contract dispute #{c.Id}" },
+                Evidence = new List<string> { $"Contract #{c.Id}: {c.Title}" }
+            };
+
+            _store.Cases[caseId] = caseFile;
+            c.Status = ContractStatus.DISPUTED;
+            SaveData();
+
+            Reply(player, "ContractDisputed", id);
+        }
+
+        private bool CanCompleteContract(BasePlayer player, Contract contract)
+        {
+            if (player == null || contract == null) return false;
+            return contract.CustomerId == player.userID || IsAdmin(player);
+        }
+
+        private bool CanDisputeContract(BasePlayer player, Contract contract)
+        {
+            if (player == null || contract == null) return false;
+            if (contract.CustomerId == player.userID) return true;
+            if (contract.ContractorId == player.userID) return true;
+            return IsAdmin(player);
+        }
+
+        private ulong ResolveDisputeSuspect(BasePlayer player, Contract contract)
+        {
+            if (contract == null) return 0;
+
+            if (player != null && player.userID == contract.CustomerId)
+                return contract.ContractorId;
+
+            if (player != null && player.userID == contract.ContractorId)
+                return contract.CustomerId;
+
+            if (IsAdmin(player))
+                return contract.ContractorId != 0 ? contract.ContractorId : contract.CustomerId;
+
+            return 0;
+        }
+
+        private bool IsAdmin(BasePlayer player)
+        {
+            return player != null && permission.UserHasPermission(player.UserIDString, PERM_ADMIN);
+        }
+
         // UI commands
         [ConsoleCommand("hrp.ui")]
         private void CmdUI(ConsoleSystem.Arg arg)
@@ -1664,6 +1908,29 @@ namespace Oxide.Plugins
                         }
                         DestroyUI(player);
                         UI_ShowBoard(player);
+                        return;
+                    }
+                case "board.complete":
+                    {
+                        var id = arg.GetInt(1, 0);
+                        if (id <= 0) return;
+                        TryCompleteContract(player, id);
+                        DestroyUI(player);
+                        UI_ShowBoard(player);
+                        return;
+                    }
+                case "board.dispute":
+                    {
+                        var id = arg.GetInt(1, 0);
+                        if (id <= 0) return;
+                        TryDisputeContract(player, id);
+                        DestroyUI(player);
+                        UI_ShowBoard(player);
+                        return;
+                    }
+                case "board.add":
+                    {
+                        player.ChatMessage(L("Prefix", player) + L("BoardAddUsage", player));
                         return;
                     }
 
@@ -1729,6 +1996,13 @@ namespace Oxide.Plugins
                 RectTransform = { AnchorMin = "0.67 0.08", AnchorMax = "0.97 0.90" }
             }, UI_ROOT, UI_BOARD + "_DETAILS");
 
+            container.Add(new CuiButton
+            {
+                Button = { Color = _config.UI.AccentColor, Command = "hrp.ui board.add" },
+                RectTransform = { AnchorMin = "0.70 0.91", AnchorMax = "0.80 0.96" },
+                Text = { Text = L("UI_Add", player), FontSize = 12, Align = TextAnchor.MiddleCenter }
+            }, UI_ROOT);
+
             // Populate top N contracts
             var contracts = _store.Contracts.Values
                 .OrderByDescending(c => c.CreatedAtUnix)
@@ -1753,6 +2027,28 @@ namespace Oxide.Plugins
                         RectTransform = { AnchorMin = $"0.82 {y}", AnchorMax = $"0.96 {y + 0.05f}" },
                         Text = { Text = L("UI_Take", player), FontSize = 12, Align = TextAnchor.MiddleCenter }
                     }, UI_BOARD);
+                }
+                else if (c.Status == ContractStatus.TAKEN || (c.Status == ContractStatus.COMPLETED && !c.PaidOut))
+                {
+                    if (CanCompleteContract(player, c))
+                    {
+                        container.Add(new CuiButton
+                        {
+                            Button = { Color = _config.UI.AccentColor, Command = $"hrp.ui board.complete {c.Id}" },
+                            RectTransform = { AnchorMin = $"0.70 {y}", AnchorMax = $"0.82 {y + 0.05f}" },
+                            Text = { Text = L("UI_Complete", player), FontSize = 12, Align = TextAnchor.MiddleCenter }
+                        }, UI_BOARD);
+                    }
+
+                    if (CanDisputeContract(player, c))
+                    {
+                        container.Add(new CuiButton
+                        {
+                            Button = { Color = _config.UI.DangerColor, Command = $"hrp.ui board.dispute {c.Id}" },
+                            RectTransform = { AnchorMin = $"0.84 {y}", AnchorMax = $"0.96 {y + 0.05f}" },
+                            Text = { Text = L("UI_Dispute", player), FontSize = 12, Align = TextAnchor.MiddleCenter }
+                        }, UI_BOARD);
+                    }
                 }
 
                 y -= 0.07f;
@@ -2092,9 +2388,9 @@ namespace Oxide.Plugins
             // Create a few sample contracts if empty
             if (_store.Contracts.Count == 0)
             {
-                _contracts.Create(player.userID, "Deliver cloth", "Bring 1000 cloth to the city warehouse.", 350, ContractType.DELIVERY);
-                _contracts.Create(player.userID, "Guard caravan", "Escort caravan to the monument and back.", 700, ContractType.GUARD);
-                _contracts.Create(player.userID, "Build shop", "Construct a small shop near the city gate.", 500, ContractType.BUILD);
+                _contracts.Create(player.userID, "Deliver cloth", "Bring 1000 cloth to the city warehouse.", 350, 350, ContractType.DELIVERY);
+                _contracts.Create(player.userID, "Guard caravan", "Escort caravan to the monument and back.", 700, 700, ContractType.GUARD);
+                _contracts.Create(player.userID, "Build shop", "Construct a small shop near the city gate.", 500, 500, ContractType.BUILD);
                 SaveData();
                 Reply(player, "ContractCreated", _store.NextContractId - 1, 0);
             }
