@@ -39,6 +39,7 @@ namespace Oxide.Plugins
 
         private PluginConfig _config;
         private string _transactionLogPath;
+        private string _auditLogPath;
 
         [PluginReference]
         private Plugin Economics;
@@ -52,6 +53,7 @@ namespace Oxide.Plugins
             public EconomySettings Economy = new EconomySettings();
             public UISettings UI = new UISettings();
             public NPCSettings NPC = new NPCSettings();
+            public PunishmentSettings Punishments = new PunishmentSettings();
 
             public class GeneralSettings
             {
@@ -163,6 +165,13 @@ namespace Oxide.Plugins
                     public float RotationY;
                     public bool FallbackOnly;
                 }
+            }
+
+            public class PunishmentSettings
+            {
+                public string JailPosition = "0 0 0";
+                public float JailRadius = 25f;
+                public bool BlockJailExit = true;
             }
         }
 
@@ -391,6 +400,7 @@ namespace Oxide.Plugins
             public long InsuranceUntilUnix;
             public long BusinessUntilUnix;
             public long CityBanUntilUnix;
+            public long JailUntilUnix;
             public int Strikes;
             public long LastDeathUnix;
 
@@ -448,19 +458,43 @@ namespace Oxide.Plugins
             public ulong JudgeId;
             public ulong ProsecutorId;
             public List<string> Charges = new List<string>();
-            public List<string> Evidence = new List<string>();
+            public List<EvidenceRecord> EvidenceItems = new List<EvidenceRecord>();
             public CaseStatus Status;
             public long CreatedAtUnix;
             public long ScheduleAtUnix;
             public Verdict Verdict;
-            public bool WarrantActive;
-            public ulong WarrantGrantedToId;
-            public ulong WarrantTargetId;
-            public long WarrantExpiresAtUnix;
+            public WarrantRecord Warrant;
             public bool RetaliationActive;
             public ulong RetaliationGrantedToId;
             public ulong RetaliationTargetId;
             public long RetaliationExpiresAtUnix;
+            public List<DetentionProtocol> Detentions = new List<DetentionProtocol>();
+        }
+
+        private class DetentionProtocol
+        {
+            public ulong OfficerId;
+            public ulong SuspectId;
+            public int Minutes;
+            public string Reason;
+            public long CreatedAtUnix;
+        }
+
+        private class WarrantRecord
+        {
+            public ulong RequestedById;
+            public ulong GrantedToId;
+            public ulong TargetId;
+            public long ExpiresAtUnix;
+            public string Reason;
+            public long CreatedAtUnix;
+        }
+
+        private class EvidenceRecord
+        {
+            public ulong AddedById;
+            public string Description;
+            public long AddedAtUnix;
         }
 
         private enum WarStatus { DECLARED, ACTIVE, ENDED }
@@ -564,6 +598,9 @@ namespace Oxide.Plugins
         private ContractService _contracts;
         private CourtService _court;
         private NPCService _npc;
+        private readonly Dictionary<ulong, ZoneType> _lastZoneType = new Dictionary<ulong, ZoneType>();
+        private readonly Dictionary<ulong, Vector3> _lastNonCityPosition = new Dictionary<ulong, Vector3>();
+        private readonly Dictionary<ulong, long> _lastJailTeleportUnix = new Dictionary<ulong, long>();
 
         private void InitServices()
         {
@@ -1007,11 +1044,11 @@ namespace Oxide.Plugins
                 var now = NowUnix();
                 foreach (var c in _p._store.Cases.Values)
                 {
-                    if (!c.WarrantActive) continue;
+                    if (c.Warrant == null) continue;
                     if (c.Status == CaseStatus.CLOSED) continue;
-                    if (c.WarrantGrantedToId != attackerId) continue;
-                    if (c.WarrantTargetId != targetOwnerId) continue;
-                    if (c.WarrantExpiresAtUnix != 0 && c.WarrantExpiresAtUnix <= now) continue;
+                    if (c.Warrant.GrantedToId != attackerId) continue;
+                    if (c.Warrant.TargetId != targetOwnerId) continue;
+                    if (c.Warrant.ExpiresAtUnix != 0 && c.Warrant.ExpiresAtUnix <= now) continue;
                     return true;
                 }
                 return false;
@@ -1098,6 +1135,7 @@ namespace Oxide.Plugins
             LoadData();
             InitServices();
             _transactionLogPath = Path.Combine(Interface.Oxide.DataFileSystem.Directory, $"{Name}_transactions.jsonl");
+            _auditLogPath = Path.Combine(Interface.Oxide.DataFileSystem.Directory, $"{Name}_audit.jsonl");
         }
 
         private void OnServerInitialized()
@@ -1140,6 +1178,11 @@ namespace Oxide.Plugins
         {
             var prof = GetOrCreateProfile(player.userID);
             prof.LastName = player.displayName;
+            if (_config.Zones.Enabled)
+            {
+                _lastZoneType[player.userID] = _zones.GetZoneType(player.transform.position);
+                _lastNonCityPosition[player.userID] = player.transform.position;
+            }
             SaveData();
         }
 
@@ -1148,6 +1191,52 @@ namespace Oxide.Plugins
             var prof = GetOrCreateProfile(player.userID);
             prof.LastDeathUnix = NowUnix();
             SaveData();
+        }
+
+        private void OnPlayerRespawned(BasePlayer player)
+        {
+            if (player == null) return;
+            var prof = GetOrCreateProfile(player.userID);
+            if (prof.JailUntilUnix <= NowUnix()) return;
+            timer.Once(0.25f, () =>
+            {
+                if (player != null && player.IsConnected)
+                    TeleportToJail(player);
+            });
+        }
+
+        private void OnPlayerTick(BasePlayer player)
+        {
+            if (player == null || !player.IsConnected) return;
+
+            var prof = GetOrCreateProfile(player.userID);
+            var now = NowUnix();
+
+            if (prof.JailUntilUnix > 0 && prof.JailUntilUnix <= now)
+            {
+                prof.JailUntilUnix = 0;
+                SaveData();
+                player.ChatMessage(L("Prefix", player) + "Jail sentence served.");
+                RecordAudit("jail_release", player.userID, player.userID, "Timer expired");
+            }
+
+            if (prof.JailUntilUnix > now)
+            {
+                EnforceJail(player, prof, now);
+            }
+
+            if (_config.Zones.Enabled)
+            {
+                var zoneType = _zones.GetZoneType(player.transform.position);
+                if (zoneType != ZoneType.CITY_SAFE)
+                    _lastNonCityPosition[player.userID] = player.transform.position;
+
+                var lastType = _lastZoneType.TryGetValue(player.userID, out var prev) ? prev : ZoneType.WILD;
+                if (zoneType == ZoneType.CITY_SAFE && lastType != ZoneType.CITY_SAFE)
+                    EnforceCityBan(player, prof, now);
+
+                _lastZoneType[player.userID] = zoneType;
+            }
         }
 
         object OnPlayerAttack(BasePlayer attacker, HitInfo info)
@@ -1357,7 +1446,7 @@ namespace Oxide.Plugins
         [ChatCommand("rp")]
         private void CmdRP(BasePlayer player, string command, string[] args)
         {
-            player.ChatMessage(L("Prefix", player) + "Commands: /board, /licenses, /buylicense <type>, /pay <player> <amount>, /insurance buy, /business register, /war <declare|accept|status>");
+            player.ChatMessage(L("Prefix", player) + "Commands: /board, /licenses, /buylicense <type>, /pay <player> <amount>, /insurance buy, /business register, /war <declare|accept|status>, /pd <sub>, /court <sub>");
         }
 
         [ChatCommand("war")]
@@ -1503,6 +1592,471 @@ namespace Oxide.Plugins
 
                 default:
                     player.ChatMessage(L("Prefix", player) + "Usage: /war declare <factionId> | /war accept <factionId> | /war status");
+                    return;
+            }
+        }
+
+        [ChatCommand("pd")]
+        private void CmdPD(BasePlayer player, string command, string[] args)
+        {
+            if (!HasPolicePermission(player))
+            {
+                Reply(player, "NoPermission");
+                return;
+            }
+
+            if (args.Length < 1)
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /pd stop|ticket|arrest|seize|warrant request");
+                return;
+            }
+
+            var sub = args[0].ToLowerInvariant();
+            switch (sub)
+            {
+                case "stop":
+                    {
+                        if (args.Length < 2)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /pd stop <player> [reason]");
+                            return;
+                        }
+
+                        var target = FindOnlinePlayer(args[1]);
+                        if (target == null)
+                        {
+                            Reply(player, "PlayerNotFound", args[1]);
+                            return;
+                        }
+
+                        var reason = args.Length > 2 ? string.Join(" ", args.Skip(2)) : "stop";
+                        target.ChatMessage(L("Prefix", target) + $"Police stop: {reason}");
+                        player.ChatMessage(L("Prefix", player) + $"Stop issued to {target.displayName}.");
+                        RecordAudit("pd_stop", player.userID, target.userID, reason);
+                        return;
+                    }
+                case "ticket":
+                    {
+                        if (args.Length < 3)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /pd ticket <player> <amount> [reason]");
+                            return;
+                        }
+
+                        var target = FindOnlinePlayer(args[1]);
+                        if (target == null)
+                        {
+                            Reply(player, "PlayerNotFound", args[1]);
+                            return;
+                        }
+
+                        if (!int.TryParse(args[2], out var amount) || amount <= 0)
+                        {
+                            Reply(player, "PayInvalidAmount");
+                            return;
+                        }
+
+                        var reason = args.Length > 3 ? string.Join(" ", args.Skip(3)) : "ticket";
+                        if (!_economy.TryWithdraw(target.userID, amount))
+                        {
+                            Reply(player, "NotEnoughMoney", amount);
+                            return;
+                        }
+
+                        _economy.TreasuryAdd(amount, "pd_ticket", player.UserIDString);
+                        target.ChatMessage(L("Prefix", target) + $"Ticket issued: {amount} ({reason}).");
+                        player.ChatMessage(L("Prefix", player) + $"Ticketed {target.displayName} for {amount}.");
+                        RecordAudit("pd_ticket", player.userID, target.userID, $"amount={amount} reason={reason}");
+                        return;
+                    }
+                case "arrest":
+                    {
+                        if (args.Length < 3)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /pd arrest <player> <minutes> [caseId] [reason]");
+                            return;
+                        }
+
+                        var target = FindOnlinePlayer(args[1]);
+                        if (target == null)
+                        {
+                            Reply(player, "PlayerNotFound", args[1]);
+                            return;
+                        }
+
+                        if (!int.TryParse(args[2], out var minutes) || minutes <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Minutes must be positive.");
+                            return;
+                        }
+
+                        int caseId = 0;
+                        var reasonIndex = 3;
+                        if (args.Length > 3 && int.TryParse(args[3], out var parsedCaseId))
+                        {
+                            caseId = parsedCaseId;
+                            reasonIndex = 4;
+                        }
+
+                        var reason = args.Length > reasonIndex ? string.Join(" ", args.Skip(reasonIndex)) : "arrest";
+                        var prof = GetOrCreateProfile(target.userID);
+                        var now = NowUnix();
+                        prof.JailUntilUnix = Math.Max(prof.JailUntilUnix, now) + minutes * 60L;
+
+                        TeleportToJail(target);
+
+                        if (caseId > 0 && _store.Cases.TryGetValue(caseId, out var caseFile))
+                        {
+                            caseFile.Detentions.Add(new DetentionProtocol
+                            {
+                                OfficerId = player.userID,
+                                SuspectId = target.userID,
+                                Minutes = minutes,
+                                Reason = reason,
+                                CreatedAtUnix = now
+                            });
+                        }
+
+                        SaveData();
+
+                        target.ChatMessage(L("Prefix", target) + $"Arrested for {minutes} minutes.");
+                        player.ChatMessage(L("Prefix", player) + $"Arrested {target.displayName} for {minutes} minutes.");
+                        RecordAudit("pd_arrest", player.userID, target.userID, $"minutes={minutes} caseId={caseId} reason={reason}");
+                        return;
+                    }
+                case "seize":
+                    {
+                        if (args.Length < 3)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /pd seize <player> <itemShortName> [amount] [reason]");
+                            return;
+                        }
+
+                        var target = FindOnlinePlayer(args[1]);
+                        if (target == null)
+                        {
+                            Reply(player, "PlayerNotFound", args[1]);
+                            return;
+                        }
+
+                        var itemDef = ItemManager.FindItemDefinition(args[2]);
+                        if (itemDef == null)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Item not found.");
+                            return;
+                        }
+
+                        var amount = 1;
+                        var reasonIndex = 3;
+                        if (args.Length > 3 && int.TryParse(args[3], out var parsedAmount))
+                        {
+                            amount = Mathf.Max(1, parsedAmount);
+                            reasonIndex = 4;
+                        }
+
+                        var removed = target.inventory.Take(null, itemDef.itemid, amount);
+                        if (removed <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Nothing to seize.");
+                            return;
+                        }
+
+                        var reason = args.Length > reasonIndex ? string.Join(" ", args.Skip(reasonIndex)) : "seize";
+                        target.ChatMessage(L("Prefix", target) + $"Seized {removed}x {itemDef.displayName.english}.");
+                        player.ChatMessage(L("Prefix", player) + $"Seized {removed}x {itemDef.displayName.english} from {target.displayName}.");
+                        RecordAudit("pd_seize", player.userID, target.userID, $"item={itemDef.shortname} amount={removed} reason={reason}");
+                        return;
+                    }
+                case "warrant":
+                    {
+                        if (args.Length < 2 || !args[1].Equals("request", StringComparison.OrdinalIgnoreCase))
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /pd warrant request <caseId> <player> <minutes> [reason]");
+                            return;
+                        }
+
+                        if (args.Length < 5)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /pd warrant request <caseId> <player> <minutes> [reason]");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[2], out var caseId) || caseId <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid case id.");
+                            return;
+                        }
+
+                        if (!_store.Cases.TryGetValue(caseId, out var caseFile))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"Case not found: {caseId}");
+                            return;
+                        }
+
+                        var target = FindOnlinePlayer(args[3]);
+                        if (target == null)
+                        {
+                            Reply(player, "PlayerNotFound", args[3]);
+                            return;
+                        }
+
+                        if (!int.TryParse(args[4], out var minutes) || minutes <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Minutes must be positive.");
+                            return;
+                        }
+
+                        var reason = args.Length > 5 ? string.Join(" ", args.Skip(5)) : "warrant";
+                        var now = NowUnix();
+                        caseFile.Warrant = new WarrantRecord
+                        {
+                            RequestedById = player.userID,
+                            GrantedToId = player.userID,
+                            TargetId = target.userID,
+                            ExpiresAtUnix = now + minutes * 60L,
+                            Reason = reason,
+                            CreatedAtUnix = now
+                        };
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"Warrant recorded for {target.displayName}.");
+                        RecordAudit("pd_warrant_request", player.userID, target.userID, $"caseId={caseId} minutes={minutes} reason={reason}");
+                        return;
+                    }
+                default:
+                    player.ChatMessage(L("Prefix", player) + "Usage: /pd stop|ticket|arrest|seize|warrant request");
+                    return;
+            }
+        }
+
+        [ChatCommand("court")]
+        private void CmdCourt(BasePlayer player, string command, string[] args)
+        {
+            if (!HasJudgePermission(player))
+            {
+                Reply(player, "NoPermission");
+                return;
+            }
+
+            if (args.Length < 1)
+            {
+                player.ChatMessage(L("Prefix", player) + "Usage: /court case create|evidence add|schedule|verdict|close");
+                return;
+            }
+
+            var sub = args[0].ToLowerInvariant();
+            switch (sub)
+            {
+                case "case":
+                    {
+                        if (args.Length < 3 || !args[1].Equals("create", StringComparison.OrdinalIgnoreCase))
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /court case create <suspect> <charge>");
+                            return;
+                        }
+
+                        var suspect = FindOnlinePlayer(args[2]);
+                        if (suspect == null)
+                        {
+                            Reply(player, "PlayerNotFound", args[2]);
+                            return;
+                        }
+
+                        var charge = args.Length > 3 ? string.Join(" ", args.Skip(3)) : "Unspecified charge";
+                        var caseId = _store.NextCaseId++;
+                        var caseFile = new CaseFile
+                        {
+                            Id = caseId,
+                            SuspectId = suspect.userID,
+                            ComplainantId = player.userID,
+                            JudgeId = player.userID,
+                            Status = CaseStatus.OPEN,
+                            CreatedAtUnix = NowUnix(),
+                            Charges = new List<string> { charge }
+                        };
+                        _store.Cases[caseId] = caseFile;
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"Case #{caseId} created against {suspect.displayName}.");
+                        RecordAudit("court_case_create", player.userID, suspect.userID, $"caseId={caseId} charge={charge}");
+                        return;
+                    }
+                case "evidence":
+                    {
+                        if (args.Length < 4 || !args[1].Equals("add", StringComparison.OrdinalIgnoreCase))
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /court evidence add <caseId> <description>");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[2], out var caseId) || caseId <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid case id.");
+                            return;
+                        }
+
+                        if (!_store.Cases.TryGetValue(caseId, out var caseFile))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"Case not found: {caseId}");
+                            return;
+                        }
+
+                        var description = string.Join(" ", args.Skip(3));
+                        caseFile.EvidenceItems.Add(new EvidenceRecord
+                        {
+                            AddedById = player.userID,
+                            Description = description,
+                            AddedAtUnix = NowUnix()
+                        });
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"Evidence added to case #{caseId}.");
+                        RecordAudit("court_evidence_add", player.userID, caseFile.SuspectId, $"caseId={caseId} evidence={description}");
+                        return;
+                    }
+                case "schedule":
+                    {
+                        if (args.Length < 3)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /court schedule <caseId> <minutes>");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[1], out var caseId) || caseId <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid case id.");
+                            return;
+                        }
+
+                        if (!_store.Cases.TryGetValue(caseId, out var caseFile))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"Case not found: {caseId}");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[2], out var minutes) || minutes <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Minutes must be positive.");
+                            return;
+                        }
+
+                        caseFile.ScheduleAtUnix = NowUnix() + minutes * 60L;
+                        caseFile.Status = CaseStatus.HEARING_SCHEDULED;
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"Case #{caseId} scheduled.");
+                        RecordAudit("court_schedule", player.userID, caseFile.SuspectId, $"caseId={caseId} minutes={minutes}");
+                        return;
+                    }
+                case "verdict":
+                    {
+                        if (args.Length < 5)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /court verdict <caseId> <jailMinutes> <fine> <cityBanMinutes> [notes]");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[1], out var caseId) || caseId <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid case id.");
+                            return;
+                        }
+
+                        if (!_store.Cases.TryGetValue(caseId, out var caseFile))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"Case not found: {caseId}");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[2], out var jailMinutes) || jailMinutes < 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid jail minutes.");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[3], out var fine) || fine < 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid fine.");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[4], out var cityBanMinutes) || cityBanMinutes < 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid city-ban minutes.");
+                            return;
+                        }
+
+                        var notes = args.Length > 5 ? string.Join(" ", args.Skip(5)) : "";
+                        caseFile.Verdict = new Verdict
+                        {
+                            JailMinutes = jailMinutes,
+                            FineToTreasury = fine,
+                            CityBanMinutes = cityBanMinutes
+                        };
+                        caseFile.Status = CaseStatus.VERDICT;
+
+                        var now = NowUnix();
+                        var suspectProfile = GetOrCreateProfile(caseFile.SuspectId);
+                        if (jailMinutes > 0)
+                        {
+                            suspectProfile.JailUntilUnix = Math.Max(suspectProfile.JailUntilUnix, now) + jailMinutes * 60L;
+                            var suspect = BasePlayer.FindByID(caseFile.SuspectId);
+                            if (suspect != null && suspect.IsConnected)
+                                TeleportToJail(suspect);
+                        }
+
+                        if (cityBanMinutes > 0)
+                        {
+                            suspectProfile.CityBanUntilUnix = Math.Max(suspectProfile.CityBanUntilUnix, now) + cityBanMinutes * 60L;
+                        }
+
+                        if (fine > 0)
+                        {
+                            if (_economy.TryWithdraw(caseFile.SuspectId, fine))
+                            {
+                                _economy.TreasuryAdd(fine, "court_fine", player.UserIDString);
+                            }
+                            else
+                            {
+                                RecordAudit("court_fine_failed", player.userID, caseFile.SuspectId, $"caseId={caseId} fine={fine}");
+                            }
+                        }
+
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"Verdict applied for case #{caseId}.");
+                        RecordAudit("court_verdict", player.userID, caseFile.SuspectId, $"caseId={caseId} jail={jailMinutes} fine={fine} cityBan={cityBanMinutes} notes={notes}");
+                        return;
+                    }
+                case "close":
+                    {
+                        if (args.Length < 2)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Usage: /court close <caseId>");
+                            return;
+                        }
+
+                        if (!int.TryParse(args[1], out var caseId) || caseId <= 0)
+                        {
+                            player.ChatMessage(L("Prefix", player) + "Invalid case id.");
+                            return;
+                        }
+
+                        if (!_store.Cases.TryGetValue(caseId, out var caseFile))
+                        {
+                            player.ChatMessage(L("Prefix", player) + $"Case not found: {caseId}");
+                            return;
+                        }
+
+                        caseFile.Status = CaseStatus.CLOSED;
+                        SaveData();
+
+                        player.ChatMessage(L("Prefix", player) + $"Case #{caseId} closed.");
+                        RecordAudit("court_case_close", player.userID, caseFile.SuspectId, $"caseId={caseId}");
+                        return;
+                    }
+                default:
+                    player.ChatMessage(L("Prefix", player) + "Usage: /court case create|evidence add|schedule|verdict|close");
                     return;
             }
         }
@@ -1834,7 +2388,15 @@ namespace Oxide.Plugins
                 Status = CaseStatus.OPEN,
                 CreatedAtUnix = NowUnix(),
                 Charges = new List<string> { $"Contract dispute #{c.Id}" },
-                Evidence = new List<string> { $"Contract #{c.Id}: {c.Title}" }
+                EvidenceItems = new List<EvidenceRecord>
+                {
+                    new EvidenceRecord
+                    {
+                        AddedById = player.userID,
+                        Description = $"Contract #{c.Id}: {c.Title}",
+                        AddedAtUnix = NowUnix()
+                    }
+                }
             };
 
             _store.Cases[caseId] = caseFile;
@@ -1877,6 +2439,16 @@ namespace Oxide.Plugins
         private bool IsAdmin(BasePlayer player)
         {
             return player != null && permission.UserHasPermission(player.UserIDString, PERM_ADMIN);
+        }
+
+        private bool HasPolicePermission(BasePlayer player)
+        {
+            return player != null && (permission.UserHasPermission(player.UserIDString, PERM_POLICE) || IsAdmin(player));
+        }
+
+        private bool HasJudgePermission(BasePlayer player)
+        {
+            return player != null && (permission.UserHasPermission(player.UserIDString, PERM_JUDGE) || IsAdmin(player));
         }
 
         // UI commands
@@ -2134,6 +2706,29 @@ namespace Oxide.Plugins
         private static long NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         private static readonly string[] WeaponLicenseTypes = { "WeaponL1", "WeaponL2", "WeaponL3" };
 
+        private class AuditEntry
+        {
+            public string Id = Guid.NewGuid().ToString("N");
+            public string Action;
+            public ulong ActorId;
+            public ulong TargetId;
+            public string Details;
+            public long CreatedAtUnix = NowUnix();
+        }
+
+        private void RecordAudit(string action, ulong actorId, ulong targetId, string details)
+        {
+            var entry = new AuditEntry
+            {
+                Action = action,
+                ActorId = actorId,
+                TargetId = targetId,
+                Details = details
+            };
+
+            AppendAuditLog(entry);
+        }
+
         private void RecordTransaction(string from, string to, int amount, string reason)
         {
             var tx = new Transaction
@@ -2163,6 +2758,73 @@ namespace Oxide.Plugins
             {
                 PrintWarning($"Failed to write transaction log: {ex.Message}");
             }
+        }
+
+        private void AppendAuditLog(AuditEntry entry)
+        {
+            if (string.IsNullOrEmpty(_auditLogPath)) return;
+            try
+            {
+                var line = JsonConvert.SerializeObject(entry);
+                File.AppendAllText(_auditLogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed to write audit log: {ex.Message}");
+            }
+        }
+
+        private bool TryParseVector3(string value, out Vector3 vec)
+        {
+            vec = Vector3.zero;
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            var parts = value.Split(' ');
+            if (parts.Length < 3) return false;
+            if (!float.TryParse(parts[0], out var x)) return false;
+            if (!float.TryParse(parts[1], out var y)) return false;
+            if (!float.TryParse(parts[2], out var z)) return false;
+            vec = new Vector3(x, y, z);
+            return true;
+        }
+
+        private Vector3 GetJailPosition()
+        {
+            return TryParseVector3(_config.Punishments.JailPosition, out var pos) ? pos : Vector3.zero;
+        }
+
+        private void TeleportToJail(BasePlayer player)
+        {
+            var pos = GetJailPosition();
+            player.Teleport(pos);
+        }
+
+        private void EnforceJail(BasePlayer player, PlayerProfile prof, long now)
+        {
+            if (!_config.Punishments.BlockJailExit) return;
+            var jailPos = GetJailPosition();
+            var distance = Vector3.Distance(player.transform.position, jailPos);
+            if (distance <= _config.Punishments.JailRadius) return;
+
+            var lastTeleport = _lastJailTeleportUnix.TryGetValue(player.userID, out var stamp) ? stamp : 0;
+            if (now - lastTeleport < 5) return;
+
+            _lastJailTeleportUnix[player.userID] = now;
+            TeleportToJail(player);
+            player.ChatMessage(L("Prefix", player) + "Jail exit is blocked.");
+            RecordAudit("jail_block_exit", player.userID, player.userID, $"distance={distance:0.0}");
+        }
+
+        private void EnforceCityBan(BasePlayer player, PlayerProfile prof, long now)
+        {
+            if (prof.CityBanUntilUnix <= now) return;
+
+            var fallback = _lastNonCityPosition.TryGetValue(player.userID, out var pos)
+                ? pos
+                : player.transform.position;
+
+            player.Teleport(fallback);
+            player.ChatMessage(L("Prefix", player) + "City access is restricted.");
+            RecordAudit("city_ban_block", player.userID, player.userID, "entry_blocked");
         }
 
         private void ApplyWeeklyBusinessTax()
